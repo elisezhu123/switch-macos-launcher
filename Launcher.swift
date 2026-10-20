@@ -10,10 +10,11 @@ let isDemoMode = CommandLine.arguments.contains("--demo")
 
 enum Paths {
     static let home = FileManager.default.homeDirectoryForCurrentUser
-    static let support = home.appendingPathComponent("Library/Application Support/MacNativeGames/TOTK")
-    static let config = support.appendingPathComponent("launcher.json")
-    static let log = home.appendingPathComponent("Library/Logs/MacNativeGames/totk.log")
-    static let cleanKeys = support.appendingPathComponent("launcher/prod.keys")
+    static let launcher = home.appendingPathComponent("Library/Application Support/MacNativeGames/sw-launcher")
+    static let config = launcher.appendingPathComponent("launcher.json")
+    /// v1.0.1 (王国之泪启动器) kept its settings here; read once to migrate, never written.
+    static let legacyConfig = home.appendingPathComponent("Library/Application Support/MacNativeGames/TOTK/launcher.json")
+    static let cleanKeys = launcher.appendingPathComponent("prod.keys")
 }
 
 struct Language: Identifiable, Hashable {
@@ -26,25 +27,6 @@ struct Language: Identifiable, Hashable {
         .init(code: "it", name: "Italiano"), .init(code: "nl", name: "Nederlands"), .init(code: "ru", name: "Русский"),
         .init(code: "pt", name: "Português"),
     ]
-}
-
-struct LauncherSettings: Codable {
-    var game = "", update = "", keys = "", firmware = "", save = "", mods = ""
-    var language = "zh-Hans"
-    var projectDir = Paths.home.appendingPathComponent("Sites/MacNativeGames").path
-    var outputApp = Paths.home.appendingPathComponent("Games/MacNative/Tears of the Kingdom.app").path
-    var workDir = Paths.home.appendingPathComponent("Games/MacNative/TOTK_build").path
-
-    static func load() -> LauncherSettings {
-        guard let data = try? Data(contentsOf: Paths.config), let s = try? JSONDecoder().decode(LauncherSettings.self, from: data) else { return LauncherSettings() }
-        return s
-    }
-    func persist() {
-        if isDemoMode { return }
-        try? FileManager.default.createDirectory(at: Paths.config.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? enc.encode(self) { try? data.write(to: Paths.config) }
-    }
 }
 
 // MARK: - System information and compatibility
@@ -166,7 +148,9 @@ enum Check { case empty, ok(String), bad(String) }
 
 @MainActor
 final class Model: ObservableObject {
-    @Published var s = LauncherSettings.load() { didSet { s.persist() } }
+    @Published var s = LauncherSettings.load(from: Paths.config, legacy: Paths.legacyConfig, home: Paths.home) { didSet { if !isDemoMode { s.write(to: Paths.config) } } }
+    /// Folders of the selected game.
+    var paths: GamePaths { GamePaths(s.selected, home: Paths.home) }
     @Published var info = SysInfo.read()
     @Published var deps: [Dep] = []
     @Published var busy: String? = nil
@@ -302,11 +286,13 @@ final class Model: ObservableObject {
             guard !s.game.isEmpty else { return .empty }
             let p = path(s.game), ext = (p as NSString).pathExtension.lowercased()
             guard fm.fileExists(atPath: p) else { return .bad("找不到这个文件") }
+            if s.selected == .botw { return ext == "nsp" ? .ok(sizeText(p)) : .bad("请选择旷野之息基础版的 .nsp 文件") }
             return ["xci", "nsp"].contains(ext) ? .ok(sizeText(p)) : .bad("请选择 .xci 或 .nsp 文件（基础版 1.0.0）")
         case .update:
             guard !s.update.isEmpty else { return .empty }
             let p = path(s.update), ext = (p as NSString).pathExtension.lowercased()
             guard fm.fileExists(atPath: p) else { return .bad("找不到这个文件") }
+            if s.selected == .botw { return ext == "nsp" ? .ok(sizeText(p)) : .bad("旷野之息需要 1.9.0 更新的 .nsp 文件") }
             return ["nsp", "nsz"].contains(ext) ? .ok(sizeText(p)) : .bad("更新包应为 .nsp 或 .nsz")
         case .keys:
             guard !s.keys.isEmpty else { return .empty }
@@ -341,7 +327,13 @@ final class Model: ObservableObject {
     }
     var depsOK: Bool { deps.filter(\.required).allSatisfy { $0.state == .ok } }
     var verdict: Verdict { Verdict.of(info) }
-    var appBuilt: Bool { isDemoMode || FileManager.default.fileExists(atPath: s.outputApp + "/Contents/MacOS/TOTK") }
+    var appBuilt: Bool { appBuilt(s.selected) }
+    func appBuilt(_ g: GameKind) -> Bool {
+        if isDemoMode { return g == .totk }
+        let app = (s.games[g.rawValue]?.outputApp ?? "") as NSString
+        return app.length > 0 && FileManager.default.fileExists(atPath: app.expandingTildeInPath + "/Contents/MacOS/" + g.executable)
+    }
+    static let botwNeedsUpdate = "旷野之息需要 1.9.0 更新文件"
 
     var blockers: [String] {
         var out: [String] = []
@@ -349,6 +341,7 @@ final class Model: ObservableObject {
         if case .ok = check(.game) {} else { out.append("游戏本体") }
         if case .ok = check(.keys) {} else { out.append("prod.keys") }
         if case .ok = check(.firmware) {} else { out.append("固件") }
+        if s.selected == .botw, case .ok = check(.update) {} else if s.selected == .botw { out.append(Model.botwNeedsUpdate) }
         for d in deps where d.required && d.state != .ok { out.append(d.title) }
         return out
     }
@@ -356,14 +349,17 @@ final class Model: ObservableObject {
     // MARK: language, save, build, launch
 
     func applyLanguage() {
-        try? FileManager.default.createDirectory(at: Paths.support, withIntermediateDirectories: true)
-        try? (s.language + "\n").write(to: Paths.support.appendingPathComponent("language.txt"), atomically: true, encoding: .utf8)
+        for g in GameKind.allCases {   // the game reads <data folder>/language.txt
+            let support = GamePaths(g, home: Paths.home).support
+            try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+            try? (s.language + "\n").write(to: support.appendingPathComponent("language.txt"), atomically: true, encoding: .utf8)
+        }
     }
 
     func importSave() {
         let fm = FileManager.default
         let src = URL(fileURLWithPath: (s.save as NSString).expandingTildeInPath)
-        let root = Paths.support.appendingPathComponent("profile/save")
+        let root = paths.profileSave
         let targets = ((try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []).filter { $0.hasDirectoryPath }
         guard targets.count == 1, let target = targets.first else {
             notice = targets.isEmpty ? "还没有游戏存档目录：请先启动一次游戏（进到标题画面即可），再导入存档。" : "发现多个存档目录，请手动处理。"
@@ -375,7 +371,7 @@ final class Model: ObservableObject {
         alert.addButton(withTitle: "备份并导入"); alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "")
-        let backup = Paths.support.appendingPathComponent("save-backup-\(stamp)")
+        let backup = paths.support.appendingPathComponent("save-backup-\(stamp)")
         let r1 = sh("/usr/bin/ditto '\(target.path)' '\(backup.path)/\(target.lastPathComponent)'")
         let r2 = r1.status == 0 ? sh("/usr/bin/ditto '\(src.path)' '\(target.path)'") : r1
         notice = r2.status == 0 ? "存档已导入。原存档备份在 \(backup.lastPathComponent)。" : "导入失败：\(r2.out)"
@@ -409,7 +405,7 @@ final class Model: ObservableObject {
                 firmware = dest
             }
             func q(_ x: String) -> String { "'" + (x as NSString).expandingTildeInPath.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-            var cmd = "/opt/homebrew/bin/python3.14 build_app.py \(q(s.game)) -k \(q(keys)) --firmware \(q(firmware)) --work \(q(s.workDir)) -o \(q(s.outputApp))"
+            var cmd = "/opt/homebrew/bin/python3.14 build_app.py --title \(s.selected.buildTitleArg) \(q(s.game)) -k \(q(keys)) --firmware \(q(firmware)) --work \(q(s.workDir)) -o \(q(s.outputApp))"
             if !s.update.isEmpty { cmd += " --update \(q(s.update))" }
             let status = await runStreaming(cmd, cwd: s.projectDir, env: ["PIP_DEFAULT_TIMEOUT": "180", "PIP_RETRIES": "10"]) { text in
                 Task { @MainActor in
@@ -421,7 +417,7 @@ final class Model: ObservableObject {
                 }
             }
             busy = nil; progress = nil
-            notice = status == 0 ? "构建完成，可以启动游戏了。" : "构建没有成功，请展开下面的日志查看原因。"
+            notice = status == 0 ? "构建完成，可以启动游戏了。第一次启动要编译着色器，会比之后慢一些。" : "构建没有成功，请展开下面的日志查看原因。"
             step = ""
         }
     }
@@ -430,7 +426,7 @@ final class Model: ObservableObject {
         guard !launching else { return }
         applyLanguage()
         launching = true; notice = "正在启动…"
-        let app = s.outputApp
+        let app = (s.outputApp as NSString).expandingTildeInPath, log = paths.log
         Task {
             let ok = await Task.detached { () -> Bool in
                 for attempt in 1...6 {
@@ -439,7 +435,7 @@ final class Model: ObservableObject {
                     _ = sh("/usr/bin/open -n '\(app)'")
                     for _ in 0..<30 {
                         try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        let head = (try? FileHandle(forReadingFrom: Paths.log))?.readData(ofLength: 400_000) ?? Data()
+                        let head = (try? FileHandle(forReadingFrom: log))?.readData(ofLength: 400_000) ?? Data()
                         let text = String(decoding: head, as: UTF8.self)
                         if text.contains("FAIL: reserve") { break }   // address space was not free this time: try again
                         if text.contains("window visible") || text.contains("启动关键管线已就绪") { return true }
@@ -449,7 +445,7 @@ final class Model: ObservableObject {
                 return false
             }.value
             self.launching = false
-            self.notice = ok ? "游戏已启动。" : "多次尝试仍未启动，请查看日志 ~/Library/Logs/MacNativeGames/totk.log"
+            self.notice = ok ? "游戏已启动。" : "多次尝试仍未启动，请查看日志 ~/Library/Logs/MacNativeGames/\(self.s.selected.logName).log"
         }
     }
 
@@ -464,47 +460,48 @@ final class Model: ObservableObject {
 // MARK: - Library entry, shader cache, bake
 
 extension Model {
-    enum Status { case built, building, notBuilt }
+    enum Status { case built, building, notBuilt, notAdded }
     struct Entry {
+        let kind: GameKind
         let title: String, subtitle: String, version: String, language: String, size: String, path: String
         let status: Status
     }
 
-    var titleID: String {
-        let name = (s.game as NSString).lastPathComponent
-        if let r = name.range(of: #"0100[0-9A-Fa-f]{12}"#, options: .regularExpression) { return String(name[r]).uppercased() }
-        return "0100F2C0115B6000"
+    var entries: [Entry] { GameKind.allCases.map(entry) }
+
+    func entry(_ g: GameKind) -> Entry {
+        let gs = s.games[g.rawValue] ?? GameSettings()
+        let gamePath = (gs.game as NSString).expandingTildeInPath
+        let built = appBuilt(g)
+        let lang = Language.all.first { $0.code == s.language }?.name ?? s.language
+        let status: Status = gs.game.isEmpty && !built ? .notAdded : (busy != nil && g == s.selected ? .building : (built ? .built : .notBuilt))
+        let size = built ? (g == .totk ? "16 GB" : "15 GB") : (FileManager.default.fileExists(atPath: gamePath) ? sizeText(gamePath) : "—")
+        return Entry(kind: g, title: g.displayName, subtitle: "\(g.englishName)  ·  \(g.titleID)", version: gameVersion(g), language: lang,
+                     size: size, path: gs.game.isEmpty ? "还没有选择游戏文件" : gamePath, status: status)
     }
 
-    var gameVersion: String {
-        let u = (s.update as NSString).lastPathComponent
+    func gameVersion(_ g: GameKind) -> String {
+        if g == .botw { return "1.9.0" }
+        let gs = s.games[g.rawValue] ?? GameSettings()
+        let u = (gs.update as NSString).lastPathComponent
         if u.contains("1.4.3") || u.contains("720896") { return "1.4.3" }
         if u.contains("1.1.2") || u.contains("65536") { return "1.1.2" }
-        let plist = s.outputApp + "/Contents/Info.plist"
+        let plist = (gs.outputApp as NSString).expandingTildeInPath + "/Contents/Info.plist"
         if let d = NSDictionary(contentsOfFile: plist), let v = d["CFBundleShortVersionString"] as? String { return v }
         return "1.0.0"
     }
 
-    var entry: Entry? {
-        guard !s.game.isEmpty else { return nil }
-        let gamePath = (s.game as NSString).expandingTildeInPath
-        let size: String
-        if appBuilt { size = "16 GB" } else { size = sizeText(gamePath) }
-        let lang = Language.all.first { $0.code == s.language }?.name ?? s.language
-        let status: Status = busy != nil ? .building : (appBuilt ? .built : .notBuilt)
-        return Entry(title: "塞尔达传说 王国之泪", subtitle: "The Legend of Zelda: Tears of the Kingdom  ·  \(titleID)",
-                     version: gameVersion, language: lang, size: size, path: gamePath, status: status)
-    }
-
-    var appIcon: NSImage? {
+    var appIcon: NSImage? { appIcon(s.selected) }
+    func appIcon(_ g: GameKind) -> NSImage? {
         if isDemoMode { return nil }   // demo screenshots must not carry the game's artwork
+        let app = ((s.games[g.rawValue]?.outputApp ?? "") as NSString).expandingTildeInPath
         for name in ["AppIcon.icns", "AppIcon.png"] {
-            if let img = NSImage(contentsOfFile: s.outputApp + "/Contents/Resources/" + name) { return img }
+            if let img = NSImage(contentsOfFile: app + "/Contents/Resources/" + name) { return img }
         }
         return nil
     }
 
-    var shaderDir: URL { Paths.support.appendingPathComponent("shader-cache/rt-totk-native-v4-unverified") }
+    var shaderDir: URL { paths.shaderDir }
 
     func refreshShaderStats() {
         if isDemoMode { return }
@@ -544,7 +541,9 @@ extension Model {
     }
 
     func addGame(from url: URL) {
-        let ext = url.pathExtension.lowercased()
+        let ext = url.pathExtension.lowercased(), name = url.lastPathComponent.uppercased()
+        if name.contains("01007EF00011E") { s.selected = .botw } else if name.contains("0100F2C0115B6") { s.selected = .totk }
+        if name.contains("01007EF00011E800") || name.contains("0100F2C0115B6800") { s.update = url.path; return }
         if ext == "xci" || ext == "nsp" { s.game = url.path }
         else if ext == "nsz" { s.update = url.path }
         else if url.lastPathComponent == "prod.keys" { s.keys = url.path }
@@ -561,13 +560,14 @@ enum Theme {
 let accent = Color(red: 0.20, green: 0.70, blue: 0.62)
 
 struct TagView: View {
-    enum Kind { case required, optional, inactive }
+    enum Kind { case required, optional, inactive, experimental }
     let kind: Kind
     var body: some View {
         let (text, color): (String, Color) = switch kind {
         case .required: ("必填", accent)
         case .optional: ("可选", .secondary)
         case .inactive: ("暂不生效", .orange)
+        case .experimental: ("实验性", .orange)
         }
         Text(text).font(.system(size: 10, weight: .semibold)).foregroundStyle(color)
             .padding(.horizontal, 7).padding(.vertical, 2)
@@ -702,13 +702,12 @@ struct MainView: View {
     @State private var query = ""
     @State private var grid = false
     @State private var showLog = false
-    @State private var selected = true
 
     var body: some View {
         VStack(spacing: 0) {
             toolbar
             Rectangle().fill(Theme.line).frame(height: 1)
-            if !model.blockers.isEmpty && model.entry != nil && !model.appBuilt { warningBar }
+            if !model.blockers.isEmpty && !model.s.game.isEmpty && !model.appBuilt { warningBar }
             library
             if showLog { logDrawer }
             statusBar
@@ -794,14 +793,10 @@ struct MainView: View {
     // MARK: library
 
     var library: some View {
-        Group {
-            if let e = model.entry {
-                let visible = query.isEmpty || (e.title + e.subtitle).localizedCaseInsensitiveContains(query)
-                if !visible { placeholder(icon: "magnifyingglass", text: "没有匹配“\(query)”的游戏") }
-                else if grid { gridView(e) } else { listView(e) }
-            } else {
-                emptyState
-            }
+        let shown = model.entries.filter { query.isEmpty || ($0.title + $0.subtitle).localizedCaseInsensitiveContains(query) }
+        return Group {
+            if shown.isEmpty { placeholder(icon: "magnifyingglass", text: "没有匹配“\(query)”的游戏") }
+            else if grid { gridView(shown) } else { listView(shown) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
@@ -832,7 +827,10 @@ struct MainView: View {
     // columns shared by header and rows
     let wVersion: CGFloat = 80, wLang: CGFloat = 96, wStatus: CGFloat = 104, wSize: CGFloat = 80
 
-    func listView(_ e: Model.Entry) -> some View {
+    func select(_ g: GameKind) { if model.busy == nil { model.s.selected = g } }
+    func primaryAction() { if model.appBuilt { model.launch() } else if model.blockers.isEmpty { model.build() } }
+
+    func listView(_ shown: [Model.Entry]) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 Text("游戏").frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 70)
@@ -845,51 +843,57 @@ struct MainView: View {
             .padding(.horizontal, 18).padding(.vertical, 7)
             .background(Theme.panel.opacity(0.7))
             Rectangle().fill(Theme.line).frame(height: 1)
-
-            HStack(spacing: 14) {
-                IconView(image: model.appIcon, size: 56)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(e.title).font(.system(size: 14.5, weight: .semibold))
-                    Text(e.subtitle).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                    Text(e.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")).font(.system(size: 10.5)).foregroundStyle(.secondary.opacity(0.7)).lineLimit(1).truncationMode(.middle)
+            ForEach(shown, id: \.kind) { e in
+                let selected = e.kind == model.s.selected
+                HStack(spacing: 14) {
+                    IconView(image: model.appIcon(e.kind), size: 56)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) { Text(e.title).font(.system(size: 14.5, weight: .semibold)); if e.kind.experimental { TagView(kind: .experimental) } }
+                        Text(e.subtitle).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                        Text(e.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")).font(.system(size: 10.5)).foregroundStyle(.secondary.opacity(0.7)).lineLimit(1).truncationMode(.middle)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(e.version).font(.system(size: 12.5)).frame(width: wVersion, alignment: .leading)
+                    Text(e.language).font(.system(size: 12.5)).frame(width: wLang, alignment: .leading)
+                    statusPill(e.status).frame(width: wStatus, alignment: .leading)
+                    Text(e.size).font(.system(size: 12.5)).foregroundStyle(.secondary).frame(width: wSize, alignment: .trailing)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                Text(e.version).font(.system(size: 12.5)).frame(width: wVersion, alignment: .leading)
-                Text(e.language).font(.system(size: 12.5)).frame(width: wLang, alignment: .leading)
-                statusPill(e.status).frame(width: wStatus, alignment: .leading)
-                Text(e.size).font(.system(size: 12.5)).foregroundStyle(.secondary).frame(width: wSize, alignment: .trailing)
+                .padding(.horizontal, 18).padding(.vertical, 10)
+                .background(selected ? accent.opacity(0.20) : Color.clear)
+                .overlay(alignment: .leading) { if selected { Rectangle().fill(accent).frame(width: 3) } }
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) { select(e.kind); primaryAction() }
+                .onTapGesture { select(e.kind) }
+                .contextMenu {
+                    Button("启动游戏") { select(e.kind); model.launch() }.disabled(!model.appBuilt(e.kind))
+                    Button(model.appBuilt(e.kind) ? "重新构建" : "构建 App") { select(e.kind); model.build() }
+                    Divider()
+                    Button("在访达中显示 App") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: ((model.s.games[e.kind.rawValue]?.outputApp ?? "") as NSString).expandingTildeInPath)]) }.disabled(!model.appBuilt(e.kind))
+                    Button("打开存档文件夹") { model.openFolder(GamePaths(e.kind, home: Paths.home).profileSave) }
+                }
+                Rectangle().fill(Theme.line).frame(height: 1)
             }
-            .padding(.horizontal, 18).padding(.vertical, 10)
-            .background(selected ? accent.opacity(0.20) : Color.clear)
-            .overlay(alignment: .leading) { if selected { Rectangle().fill(accent).frame(width: 3) } }
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) { if model.appBuilt { model.launch() } else if model.blockers.isEmpty { model.build() } }
-            .onTapGesture { selected = true }
-            .contextMenu {
-                Button("启动游戏") { model.launch() }.disabled(!model.appBuilt)
-                Button(model.appBuilt ? "重新构建" : "构建 App") { model.build() }.disabled(!model.blockers.isEmpty)
-                Divider()
-                Button("在访达中显示 App") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.s.outputApp)]) }.disabled(!model.appBuilt)
-                Button("打开存档文件夹") { model.openFolder(Paths.support.appendingPathComponent("profile/save")) }
-            }
-            Rectangle().fill(Theme.line).frame(height: 1)
             Spacer(minLength: 0)
         }
     }
 
-    func gridView(_ e: Model.Entry) -> some View {
+    func gridView(_ shown: [Model.Entry]) -> some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 190, maximum: 220), spacing: 20)], spacing: 20) {
-                VStack(spacing: 10) {
-                    IconView(image: model.appIcon, size: 128)
-                    Text(e.title).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
-                    HStack(spacing: 6) { Text(e.version).font(.system(size: 11)).foregroundStyle(.secondary); statusPill(e.status) }
+                ForEach(shown, id: \.kind) { e in
+                    let selected = e.kind == model.s.selected
+                    VStack(spacing: 10) {
+                        IconView(image: model.appIcon(e.kind), size: 128)
+                        Text(e.title).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
+                        HStack(spacing: 6) { Text(e.version).font(.system(size: 11)).foregroundStyle(.secondary); statusPill(e.status) }
+                        if e.kind.experimental { TagView(kind: .experimental) }
+                    }
+                    .padding(18).frame(maxWidth: .infinity)
+                    .background(selected ? accent.opacity(0.20) : Theme.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(selected ? accent : Theme.line))
+                    .onTapGesture(count: 2) { select(e.kind); primaryAction() }
+                    .onTapGesture { select(e.kind) }
                 }
-                .padding(18).frame(maxWidth: .infinity)
-                .background(selected ? accent.opacity(0.20) : Theme.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(selected ? accent : Theme.line))
-                .onTapGesture(count: 2) { if model.appBuilt { model.launch() } else if model.blockers.isEmpty { model.build() } }
-                .onTapGesture { selected = true }
             }
             .padding(24)
         }
@@ -900,6 +904,7 @@ struct MainView: View {
         case .built: ("可启动", accent)
         case .building: ("构建中", .orange)
         case .notBuilt: ("未构建", .secondary)
+        case .notAdded: ("未添加", .secondary)
         }
         return HStack(spacing: 5) { Circle().fill(c).frame(width: 7, height: 7); Text(t).font(.system(size: 12)) }
     }
@@ -924,7 +929,7 @@ struct MainView: View {
                     ProgressView().controlSize(.small)
                     Text(model.notice ?? "正在启动…").font(.system(size: 11.5)).foregroundStyle(.secondary)
                 } else {
-                    Text(model.notice ?? (model.entry == nil ? "把 .xci / .nsp 拖进来开始" : (model.appBuilt ? "就绪" : "还没有构建"))).font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(1)
+                    Text(model.notice ?? (model.s.game.isEmpty ? "选中一款游戏，再到设置里选好游戏文件（也可以把文件拖进来）" : (model.appBuilt ? "就绪" : "还没有构建"))).font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
             Spacer()
@@ -972,9 +977,17 @@ struct SettingsView: View {
         ScrollView { VStack(alignment: .leading, spacing: 16) { c() }.padding(22).frame(maxWidth: .infinity, alignment: .leading) }
     }
 
+    /// Which game the per-game fields (game file, update, save, mods, output) belong to.
+    var gamePicker: some View {
+        Picker("游戏", selection: $model.s.selected) {
+            ForEach(GameKind.allCases) { g in Text(g.displayName + (g.experimental ? "（实验性）" : "")).tag(g) }
+        }.pickerStyle(.segmented).disabled(model.busy != nil)
+    }
+
     var filesTab: some View {
         pane {
-            PathRow(title: "游戏本体（XCI / NSP）", tag: .required, value: $model.s.game, check: model.check(.game)) {
+            gamePicker
+            PathRow(title: model.s.selected == .botw ? "游戏本体（基础版 NSP）" : "游戏本体（XCI / NSP）", tag: .required, value: $model.s.game, check: model.check(.game)) {
                 if let p = model.pick(directory: false, extensions: ["xci", "nsp"], title: "选择游戏本体") { model.s.game = p }
             }
             PathRow(title: "prod.keys", tag: .required, value: $model.s.keys, check: model.check(.keys)) {
@@ -983,7 +996,7 @@ struct SettingsView: View {
             PathRow(title: "固件（文件夹或 .zip）", tag: .required, value: $model.s.firmware, check: model.check(.firmware)) {
                 if let p = model.pick(directory: true, extensions: ["zip"], title: "选择固件") { model.s.firmware = p }
             }
-            PathRow(title: "更新包（1.1.2 / 1.4.3，NSP 或 NSZ）", tag: .optional, value: $model.s.update, check: model.check(.update)) {
+            PathRow(title: model.s.selected == .botw ? "更新包（1.9.0，NSP）" : "更新包（1.1.2 / 1.4.3，NSP 或 NSZ）", tag: model.s.selected == .botw ? .required : .optional, value: $model.s.update, check: model.check(.update)) {
                 if let p = model.pick(directory: false, extensions: ["nsp", "nsz"], title: "选择更新包") { model.s.update = p }
             }
             DisclosureGroup("高级：输出位置", isExpanded: $advanced) {
@@ -1074,12 +1087,13 @@ struct SettingsView: View {
 
     var extrasTab: some View {
         pane {
+            gamePicker
             PathRow(title: "存档", tag: .optional, value: $model.s.save, check: model.check(.save)) {
                 if let p = model.pick(directory: true, title: "选择存档文件夹") { model.s.save = p }
             }
             HStack {
                 Button("导入存档到游戏…") { model.importSave() }.disabled({ if case .ok = model.check(.save) { return false }; return true }())
-                Button("打开游戏存档文件夹") { model.openFolder(Paths.support.appendingPathComponent("profile/save")) }
+                Button("打开游戏存档文件夹") { model.openFolder(model.paths.profileSave) }
             }
             Text("导入前会自动备份现有存档。第一次需要先启动一次游戏，让它创建存档目录。").font(.system(size: 11)).foregroundStyle(.secondary)
             Divider()
@@ -1156,9 +1170,9 @@ struct LauncherApp: App {
                 Button("重新检查环境") { model.refreshDeps() }
                 Button("烘焙着色器缓存") { model.bake() }
                 Divider()
-                Button("打开游戏存档文件夹") { model.openFolder(Paths.support.appendingPathComponent("profile/save")) }
+                Button("打开游戏存档文件夹") { model.openFolder(model.paths.profileSave) }
                 Button("打开着色器缓存文件夹") { model.openFolder(model.shaderDir) }
-                Button("打开日志文件") { NSWorkspace.shared.open(Paths.log) }
+                Button("打开日志文件") { NSWorkspace.shared.open(model.paths.log) }
             }
             CommandGroup(replacing: .help) {
                 Link("构建工具主页（GitHub）", destination: URL(string: "https://github.com/ly05010419/MacNativeGames")!)
@@ -1175,6 +1189,11 @@ extension Array {
 extension Model {
     /// Fixed sample data for the layout snapshot only.
     func demo() {
+        s.selected = .botw
+        s.game = "~/Games/Switch/BOTW/nsp/BOTW [01007EF00011E000][v0].nsp"
+        s.update = "~/Games/Switch/BOTW/nsp/BOTW 1.9.0 [01007EF00011E800][v1114112].nsp"
+        s.outputApp = "~/Games/Switch/BOTW/Breath of the Wild.app"
+        s.selected = .totk
         s.game = "~/Games/Switch/TOTK/xci/TOTK [0100F2C0115B6000][v0].xci"
         s.keys = "~/Games/Switch/Keys/prod.keys"
         s.firmware = "~/Games/Switch/Firmware"

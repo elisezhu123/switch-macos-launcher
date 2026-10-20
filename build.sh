@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 VERSION="${1:-1.0.1}"
 APP="王国之泪启动器.app"
 rm -rf "$APP" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos15.0 Launcher.swift -o "$APP/Contents/MacOS/TOTKLauncher"
+swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos15.0 Launcher.swift LauncherCore.swift -o "$APP/Contents/MacOS/TOTKLauncher"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
