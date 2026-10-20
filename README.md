@@ -43,7 +43,7 @@
 
 ### 相对上游的改进（`totk-mac-fixes.patch`）
 
-补丁只涉及 3 个文件，基于上游提交 `41e1e0c`；启动器下载构建工具时会**固定到该提交并自动应用补丁**。
+补丁只涉及 5 个文件，基于上游提交 `41e1e0c`；启动器下载构建工具时会**固定到该提交并自动应用补丁**。
 
 | 改进 | 说明 | 实测（M1 Max，8290 个着色器） |
 |---|---|---|
@@ -51,12 +51,13 @@
 | **持久着色器缓存** | 把每个着色器预先编译成 `.metallib` 文件放在本机，不依赖会被其他 Metal 程序挤掉的系统缓存。需要 Metal Toolchain。 | 系统缓存冷时的预热：单线程约 40 分钟（按速度估算）→ 多线程约 8 分钟 → 用预编译库后首次约 23 秒，之后稳定约 7 秒。 |
 | **内存布局回退** | 部分 Mac 上游戏要的固定地址段无法预留。默认布局放不下时，回退到"栈、堆、alias 并排"的单块布局（alias 默认 12 GiB）。 | 在 M1 Max + macOS 27 上让游戏能启动；该机器上观察到约一半的启动会预留失败，启动器会自动重试。 |
 | **语言设置文件** | 双击启动的 App 读不到环境变量，改为读取 `~/Library/Application Support/MacNativeGames/TOTK/language.txt`。 | — |
+| **默认以原生 2K 启动**（v1.0.1） | 上游默认以 1920×1080 启动（画在 2560×1440 画布的左上角）。在测试机上，这一档和随后的 MetalFX 档都显示黑屏，完整 2560×1440 输出正常，所以默认改为以 2560×1440 启动。想回到上游的 1080p 启动，设环境变量 `TOTK_OUTPUT_RES=auto`。 | 启动后直接有画面，不用再按 `3`；整张画布都被画满。代价是渲染分辨率比 1080p 高，GPU 负担更重。 |
 
 ### Mods 与其他尚未实现的事
 
 - **Mods：入口已预留，暂未实现。** 游戏运行时目前没有 Mods 加载器，设置里的 Mods 路径只会被保存，不会被应用（界面上标着"暂不生效"）。欢迎贡献。
-- 默认画质档（MetalFX）在测试机上显示黑屏；在游戏窗口里按 `3` 切换画质档后可以显示。尚未修复。
-- 在游戏里：`1` 显示 / 隐藏帧率等信息，`2` 切换补帧，`3` 切换画质。
+- **1080p 启动档和 MetalFX 档在测试机上仍会黑屏**（v1.0.1 起默认已避开它们，改为原生 2K 启动）。游戏渲染和放大后的输出都是正常的，问题出在最后把画面送到窗口显示的一步，**根本原因没有找到**；在其他 Mac 上是否也会这样未知。
+- 在游戏里：`1` 显示 / 隐藏帧率等信息，`2` 切换补帧，`3` 循环切换画质（原生 2K → 关闭 2K（1080p）→ MetalFX 2K → 原生 2K；在测试机上只有"原生 2K"有画面）。
 
 ### 系统要求
 
@@ -120,9 +121,9 @@ It is **derived from [MacNativeGames](https://github.com/ly05010419/MacNativeGam
 
 **Features**: game-library window (drag & drop `.xci`/`.nsp`), system detection (macOS 26+, Metal 4, M-series, RAM), environment check with background installers (including the 839 MB Metal Toolchain), 12 game languages (Simplified Chinese by default), save import with automatic backup, build progress, and automatic retry when the game fails to reserve its address space.
 
-**Patch (`totk-mac-fixes.patch`, against upstream commit `41e1e0c`)**: multi-threaded shader pre-warming (6 threads by default, `TOTK_WARM_THREADS`), a persistent precompiled shader cache (`.metallib` files that other Metal apps cannot evict), a memory-layout fallback for Macs where the default fixed addresses cannot be reserved, and a `language.txt` setting.
+**Patch (`totk-mac-fixes.patch`, 5 files, against upstream commit `41e1e0c`)**: multi-threaded shader pre-warming (6 threads by default, `TOTK_WARM_THREADS`), a persistent precompiled shader cache (`.metallib` files that other Metal apps cannot evict), a memory-layout fallback for Macs where the default fixed addresses cannot be reserved, a `language.txt` setting, and (v1.0.1) **starting in native 2560×1440 by default** (`TOTK_OUTPUT_RES=auto` restores the upstream 1080p start).
 
-**Not implemented**: **mods** — the field is reserved in the UI but the game runtime has no mod loader yet, so nothing is applied. The default MetalFX picture mode showed a black screen on the test machine (press `3` in-game to switch).
+**Not implemented / known issues**: **mods** — the field is reserved in the UI but the game runtime has no mod loader yet, so nothing is applied. On the test machine (M1 Max, macOS 27) the 1080p start mode and the MetalFX mode show a black window while the full 2560×1440 output works; the scene and the upscaled output are rendered correctly, the failure is in the last step that puts the picture on the window. The root cause was not found, v1.0.1 simply avoids those modes by default.
 
 **Requirements**: macOS 26+ and Metal 4 (the launcher itself targets macOS 15 but will report "unsupported" on older systems), Apple silicon, 16 GB+ recommended. Tested only on an M1 Max / 64 GB / macOS 27.0.1.
 

@@ -1060,7 +1060,7 @@ struct SettingsView: View {
             if let p = model.progress, model.busy == "烘焙着色器" { ProgressView(value: p).tint(accent); Text(model.step).font(.system(size: 11)).foregroundStyle(.secondary) }
             Divider()
             Text("画质模式").font(.system(size: 13, weight: .semibold))
-            Text("游戏窗口里按 3 切换：MetalFX 2K → 原生 2K → 关闭。按 1 显示 / 隐藏帧率等信息，按 2 切换补帧。").font(.system(size: 12)).foregroundStyle(.secondary)
+            Text("默认以原生 2K（2560×1440）启动。游戏窗口里按 3 循环切换：原生 2K → 关闭 2K（1080p）→ MetalFX 2K。在测试机（M1 Max，macOS 27）上只有原生 2K 有画面，另外两档会黑屏。按 1 显示 / 隐藏帧率等信息，按 2 切换补帧。").font(.system(size: 12)).foregroundStyle(.secondary)
         }
     }
 
@@ -1098,7 +1098,7 @@ struct SettingsView: View {
                 IconView(image: model.appIcon, size: 64)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("王国之泪 启动器").font(.system(size: 18, weight: .bold))
-                    Text("版本 1.0 · 需要 macOS 26+ 与 Metal 4").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text("版本 1.0.1 · 需要 macOS 26+ 与 Metal 4").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }
             Text("这个启动器只负责检测环境、调用构建脚本、导入存档和启动游戏。游戏本体、密钥和固件都必须是你自己的，启动器不包含任何游戏内容。").font(.system(size: 12)).foregroundStyle(.secondary)

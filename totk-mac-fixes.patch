@@ -1,6 +1,38 @@
+diff -urN a/games/totk/runtime/game_patches.c b/games/totk/runtime/game_patches.c
+--- a/games/totk/runtime/game_patches.c	2026-10-18 17:21:08
++++ b/games/totk/runtime/game_patches.c	2026-10-20 22:41:04
+@@ -252,7 +252,12 @@
+     if (!decided) {
+         const char *e = getenv("TOTK_OUTPUT_RES");
+         if (e && !strcmp(e, "0")) on = 0;
+-        else if (!e || !*e || !strcmp(e, "auto")) on = output_res_auto(&cw, &ch);
++        else if (!e || !*e || !strcmp(e, "auto")) {
++            on = output_res_auto(&cw, &ch);
++            /* Start in true 2K unless TOTK_OUTPUT_RES=auto is given explicitly (the 1920x1080 start shows a black window on some Macs,
++               observed: M1 Max, macOS 27; the full 2560x1440 output does not). Key 3 still cycles the modes. */
++            if (on && (!e || !*e)) { output_full_at_start = 1; fprintf(stderr, "[totk] true 2K: starts at %ux%u (set TOTK_OUTPUT_RES=auto for the 1920x1080 start)\n", cw, ch); }
++        }
+         else if (sscanf(e, "%ux%u", &cw, &ch) != 2 || cw < 640 || ch < 360 || cw > 7680 || ch > 4320) runtime_fail("TOTK_OUTPUT_RES must be <width>x<height> (640x360 .. 7680x4320), auto or 0");
+         else on = 1;
+         decided = 1;
+diff -urN a/games/totk/runtime/game_patches_v143.c b/games/totk/runtime/game_patches_v143.c
+--- a/games/totk/runtime/game_patches_v143.c	2026-10-18 17:21:08
++++ b/games/totk/runtime/game_patches_v143.c	2026-10-20 22:41:04
+@@ -126,7 +126,10 @@
+             const char *dir=getenv("TOTK_ROMFS_PATCHES_OUT");char path[4096];
+             snprintf(path,sizeof path,"%s/2560x1440/manifest.tsv",dir?dir:"extracted/v143/romfs-patches-out");
+             FILE *f=fopen(path,"r");if(f){fclose(f);on=1;cw=2560;ch=1440;}
+-            output_full_at_start=0;
++            /* Start in true 2K unless TOTK_OUTPUT_RES=auto is given explicitly: on some Macs (observed: M1 Max, macOS 27) the 1920x1080
++               start, which draws into the top-left of the 2560x1440 canvas, and the MetalFX mode after it show a black window, while the
++               full 2560x1440 output shows the picture. Key 3 still cycles the modes. */
++            output_full_at_start=(!e||!*e);
+         }else{
+             char tail;
+             if(sscanf(e,"%ux%u%c",&cw,&ch,&tail)!=2||cw<640||ch<360||cw>7680||ch>4320)runtime_fail("TOTK_OUTPUT_RES must be auto, 0 or widthxheight");
 diff -urN a/games/totk/runtime/services.c b/games/totk/runtime/services.c
 --- a/games/totk/runtime/services.c	2026-10-18 17:21:08
-+++ b/games/totk/runtime/services.c	2026-10-20 21:50:29
++++ b/games/totk/runtime/services.c	2026-10-20 22:41:04
 @@ -36,6 +36,7 @@
  #define STACK_SIZE 0x10000000ULL
  #define HEAP_OFF (STACK_OFF+STACK_SIZE+0x10000000ULL)
@@ -59,7 +91,7 @@ diff -urN a/games/totk/runtime/services.c b/games/totk/runtime/services.c
    if(value)CFStringGetCString(value,language,sizeof(language),kCFStringEncodingUTF8);CFRelease(locale);
 diff -urN a/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m b/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
 --- a/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m	2026-10-18 17:21:08
-+++ b/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m	2026-10-20 21:50:29
++++ b/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m	2026-10-20 22:41:04
 @@ -4705,7 +4705,24 @@
      if (nbad) MLOG("【红】着色器 %s（阶段 %d）读驱动段的这些位置回放层不填，读到 0：%s", o->key, o->stage, bad);
      return nunfill;
@@ -136,7 +168,7 @@ diff -urN a/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m b/games/totk/third_
      // profile-specific list and remaining translated variants finish behind
 diff -urN a/games/totk/tools/bake_metallibs.py b/games/totk/tools/bake_metallibs.py
 --- a/games/totk/tools/bake_metallibs.py	1970-01-01 08:00:00
-+++ b/games/totk/tools/bake_metallibs.py	2026-10-20 21:50:29
++++ b/games/totk/tools/bake_metallibs.py	2026-10-20 22:41:04
 @@ -0,0 +1,83 @@
 +#!/usr/bin/env python3
 +"""Bake the translated shader sources (<key>.metal) of a shader cache directory into <key>.metallib next to them.
