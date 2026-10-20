@@ -69,7 +69,46 @@ func testOrderKeepsUnknownModsSorted() {
     expect(names == ["C", "A", "B"], "listed order first, then by name: \(names)")
 }
 
+
+// MARK: Task 8
+func holdSlot(_ g: GameKind, home: URL, start: UInt64?) -> Int32 {
+    let slot = GamePaths(g, home: home).gameSlot
+    try! FileManager.default.createDirectory(at: slot, withIntermediateDirectories: true)
+    let lock = slot.appendingPathComponent("lock").path
+    FileManager.default.createFile(atPath: lock, contents: nil)
+    let fd = open(lock, O_RDONLY)
+    _ = flock(fd, LOCK_EX)
+    let me = getpid()
+    let holder = "owner=user\ngame_pid=\(me)\ngame_start=\(start ?? processStart(me))\n"
+    try! holder.write(to: slot.appendingPathComponent("holder"), atomically: true, encoding: .utf8)
+    return fd
+}
+
+func testIdleWhenNoLock() {
+    let home = tempHome()
+    if case .idle = runState(for: .totk, home: home) {} else { expect(false, "idle without a slot") }
+}
+
+func testOtherGameRunningBlocksLaunch() {
+    let home = tempHome()
+    let fd = holdSlot(.botw, home: home, start: nil)
+    defer { close(fd) }
+    if case .otherGameRunning(let g) = runState(for: .totk, home: home) { expect(g == .botw, "botw reported") }
+    else { expect(false, "other game running") }
+    if case .running(let pid) = runState(for: .botw, home: home) { expect(pid == getpid(), "own pid") }
+    else { expect(false, "botw itself is running") }
+}
+
+func testStaleHolderIsIdle() {
+    let home = tempHome()
+    let fd = holdSlot(.botw, home: home, start: 12345)
+    defer { close(fd) }
+    if case .idle = runState(for: .botw, home: home) {} else { expect(false, "start time mismatch means not our game") }
+}
+
 var extraTests: [(String, () -> Void)] = [
+    ("testIdleWhenNoLock", testIdleWhenNoLock), ("testOtherGameRunningBlocksLaunch", testOtherGameRunningBlocksLaunch),
+    ("testStaleHolderIsIdle", testStaleHolderIsIdle),
     ("testScanBothLayouts", testScanBothLayouts), ("testLaterModWins", testLaterModWins),
     ("testDisabledModIgnored", testDisabledModIgnored), ("testManifestEscapesPaths", testManifestEscapesPaths),
     ("testAllDisabledRemovesManifest", testAllDisabledRemovesManifest), ("testNewFileIsReported", testNewFileIsReported),

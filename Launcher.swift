@@ -426,16 +426,25 @@ final class Model: ObservableObject {
 
     func launch() {
         guard !launching else { return }
+        let game = s.selected
+        switch runState(for: game, home: Paths.home) {
+        case .running(let pid):   // already running: bring it to the front, never start a second copy
+            NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateAllWindows])
+            notice = "\(game.displayName) 已经在运行。"; return
+        case .otherGameRunning(let other):
+            notice = "另一款游戏（\(other.displayName)）正在运行，请先退出它。"; return
+        case .idle: break
+        }
         applyLanguage()
-        if let problem = syncModsManifest() { notice = problem }
-        launching = true; notice = "正在启动…"
+        let problem = syncModsManifest()
+        launching = true; notice = problem ?? "正在启动…"
         let app = (s.outputApp as NSString).expandingTildeInPath, log = paths.log
         Task {
             let ok = await Task.detached { () -> Bool in
                 for attempt in 1...6 {
-                    _ = sh("pkill -f totk-native")
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                    _ = sh("/usr/bin/open -n '\(app)'")
+                    // A failed attempt exits by itself; wait until its slot is free instead of killing anything.
+                    for _ in 0..<20 { if case .idle = runState(for: game, home: Paths.home) { break }; try? await Task.sleep(nanoseconds: 500_000_000) }
+                    _ = sh("/usr/bin/open -n '\(app.replacingOccurrences(of: "'", with: "'\\''"))'")
                     for _ in 0..<30 {
                         try? await Task.sleep(nanoseconds: 1_000_000_000)
                         let head = (try? FileHandle(forReadingFrom: log))?.readData(ofLength: 400_000) ?? Data()
@@ -448,7 +457,7 @@ final class Model: ObservableObject {
                 return false
             }.value
             self.launching = false
-            self.notice = ok ? "游戏已启动。" : "多次尝试仍未启动，请查看日志 ~/Library/Logs/MacNativeGames/\(self.s.selected.logName).log"
+            self.notice = ok ? "游戏已启动。" : "多次尝试仍未启动，请查看日志 ~/Library/Logs/MacNativeGames/\(game.logName).log"
         }
     }
 

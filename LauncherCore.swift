@@ -209,3 +209,40 @@ func parseModWarnings(log: String) -> [String] {
         return String(line.dropFirst(prefix.count).dropLast(suffix.count))
     }
 }
+
+// MARK: - Which game is running
+
+enum RunState { case idle, running(pid: Int32), otherGameRunning(GameKind) }
+
+/// Start time (seconds) of a live process, 0 if it is gone or a zombie; with the pid it names one process exactly.
+func processStart(_ pid: Int32) -> UInt64 {
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    guard pid > 0, proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size, info.pbi_status != UInt32(SZOMB) else { return 0 }
+    return info.pbi_start_tvsec
+}
+
+/// The game holding `slot` (runtime/game_slot.c: an exclusive lock on <slot>/lock, the player's game named in <slot>/holder),
+/// as app/launcher.m's running_game reads it. A test run by someone else (owner other than "user") does not count.
+func slotHolder(_ slot: URL) -> Int32? {
+    let fd = open(slot.appendingPathComponent("lock").path, O_RDONLY | O_CLOEXEC)
+    guard fd >= 0 else { return nil }
+    let held = flock(fd, LOCK_EX | LOCK_NB) != 0
+    close(fd)
+    guard held, let text = try? String(contentsOf: slot.appendingPathComponent("holder"), encoding: .utf8) else { return nil }
+    var kv: [String: String] = [:]
+    for line in text.split(separator: "\n") {
+        if let eq = line.firstIndex(of: "="), kv[String(line[..<eq])] == nil { kv[String(line[..<eq])] = String(line[line.index(after: eq)...]) }
+    }
+    guard kv["owner"] == "user", let pid = Int32(kv["game_pid"] ?? ""), let start = UInt64(kv["game_start"] ?? ""),
+          start != 0, processStart(pid) == start else { return nil }
+    return pid
+}
+
+func runState(for game: GameKind, home: URL) -> RunState {
+    if let pid = slotHolder(GamePaths(game, home: home).gameSlot) { return .running(pid: pid) }
+    for other in GameKind.allCases where other != game {
+        if slotHolder(GamePaths(other, home: home).gameSlot) != nil { return .otherGameRunning(other) }
+    }
+    return .idle
+}
