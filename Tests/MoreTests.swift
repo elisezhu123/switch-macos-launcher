@@ -131,7 +131,71 @@ func testInstallCommandQuotesPaths() {
     expect(shQuote("a'b") == "'a'\\''b'", "quote: \(shQuote("a'b"))")
 }
 
+
+// MARK: final review fixes
+func testUpgradeFallsBackToFreshTool() {
+    let c = upgradeCommand(project: "/p/My 'Tools'", fresh: "/p/My 'Tools'-sw-launcher", baseCommit: "abc", patches: ["/r/a.patch", "/r/b.patch"])
+    expect(shellParses(c), "upgrade command parses")
+    expect(c.contains("git fetch --depth 1 origin abc") && c.contains(freshToolMarker), "fresh install fallback with marker")
+}
+
+func testBadRomfsPathsAreSkipped() {
+    let d = tempHome()
+    makeFile(d, "A/romfs/ok.txt"); makeFile(d, "A/romfs/romfs\\Actor\\x.bin")
+    let skipped = try! writeManifest(resolveMods(scanMods(dir: d, titleID: "X"), order: [], enabled: [:]), to: d.appendingPathComponent("m.tsv"))
+    expect(skipped == ["romfs\\Actor\\x.bin"], "backslash path skipped: \(skipped)")
+    let text = try! String(contentsOf: d.appendingPathComponent("m.tsv"), encoding: .utf8)
+    expect(text.hasPrefix("ok.txt\t") && !text.contains("\\"), "only the valid file listed")
+}
+
+func testFreshLogIgnoresPreviousRun() {
+    let d = tempHome(), log = d.appendingPathComponent("botw.log")
+    try! "window visible\n".write(to: log, atomically: false, encoding: .utf8)
+    let before = fileIdentity(log)
+    expect(freshLog(log, notSameAs: before) == nil, "same file is the previous run")
+    try! FileManager.default.moveItem(at: log, to: d.appendingPathComponent("botw.previous.log"))
+    try! "FAIL: reserve\n".write(to: log, atomically: false, encoding: .utf8)
+    expect(freshLog(log, notSameAs: before) == "FAIL: reserve\n", "rotated log is read")
+}
+
+func testLaunchFailureMessages() {
+    expect(launchFailure(log: "x\n[totk] FAIL: reserve guest stack\n") == nil, "reserve failures are retried")
+    let m = launchFailure(log: "[totk] mod file changed since the launcher listed it: UI/a\n[totk] FAIL: RomFS mod file changed; start the game from the launcher again\n")
+    expect(m?.contains("Mod") == true, "mods failure explained: \(m ?? "nil")")
+    expect(launchFailure(log: "[totk] FAIL: RomFS integrity mismatch\n")?.contains("RomFS integrity mismatch") == true, "other failures shown")
+    expect(launchFailure(log: "all good\n") == nil, "no failure")
+}
+
+func testAppSupportsMods() {
+    expect(appSupportsMods(info: ["SWModsManifest": true]), "new build")
+    expect(!appSupportsMods(info: ["CFBundleExecutable": "TOTK"]), "v1.0.1 build")
+}
+
+
+func run(_ cmd: String) -> Int32 {
+    let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/zsh"); p.arguments = ["-c", cmd]
+    p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+    try! p.run(); p.waitUntilExit(); return p.terminationStatus
+}
+
+func testPatchesStopAtFirstFailureEvenInsideOr() {
+    let d = tempHome(), repo = d.appendingPathComponent("repo")
+    try! FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+    try! "one\n".write(to: repo.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+    try! "two\n".write(to: repo.appendingPathComponent("b.txt"), atomically: true, encoding: .utf8)
+    _ = run("cd \(shQuote(repo.path)) && git init -q && git add -A && git -c user.name=t -c user.email=t@t commit -qm init")
+    let bad = d.appendingPathComponent("bad.patch"), good = d.appendingPathComponent("good.patch")
+    try! "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-nope\n+x\n".write(to: bad, atomically: true, encoding: .utf8)
+    try! "--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-two\n+TWO\n".write(to: good, atomically: true, encoding: .utf8)
+    let status = run("( " + patchesCommand(project: repo.path, patches: [bad.path, good.path]) + " ) || exit 7")
+    expect(status == 7, "failure reaches the || fallback: \(status)")
+    expect((try? String(contentsOf: repo.appendingPathComponent("b.txt"), encoding: .utf8)) == "two\n", "later patch not applied after a failure")
+}
+
 var extraTests: [(String, () -> Void)] = [
+    ("testPatchesStopAtFirstFailureEvenInsideOr", testPatchesStopAtFirstFailureEvenInsideOr),
+    ("testUpgradeFallsBackToFreshTool", testUpgradeFallsBackToFreshTool), ("testBadRomfsPathsAreSkipped", testBadRomfsPathsAreSkipped),
+    ("testFreshLogIgnoresPreviousRun", testFreshLogIgnoresPreviousRun), ("testLaunchFailureMessages", testLaunchFailureMessages), ("testAppSupportsMods", testAppSupportsMods),
     ("testInstallCommandAppliesBothPatchesInOrder", testInstallCommandAppliesBothPatchesInOrder), ("testInstallCommandQuotesPaths", testInstallCommandQuotesPaths),
     ("testIdleWhenNoLock", testIdleWhenNoLock), ("testOtherGameRunningBlocksLaunch", testOtherGameRunningBlocksLaunch),
     ("testStaleHolderIsIdle", testStaleHolderIsIdle),

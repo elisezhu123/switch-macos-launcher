@@ -181,13 +181,14 @@ func resolveMods(_ mods: [ModInfo], order: [String], enabled: [String: Bool]) ->
 }
 
 /// Writes the runtime's manifest (`<RomFS path>\t<host path>\t<size>`, runtime/romfs_mods.h), sorted by path; removes it
-/// when no file is left. Returns the RomFS paths skipped because a path contains a tab or a line break.
+/// when no file is left. Returns the RomFS paths skipped because the runtime would reject them (romfsPathOK) or a host path
+/// contains a tab or a line break.
 @discardableResult
 func writeManifest(_ r: ModResolution, to file: URL) throws -> [String] {
     var lines: [String] = [], skipped: [String] = []
     for path in r.winners.keys.sorted() {
         let host = r.winners[path]!.file.path
-        if (path + host).contains(where: { $0 == "\t" || $0 == "\n" || $0 == "\r" }) { skipped.append(path); continue }
+        if !romfsPathOK(path) || host.contains(where: { $0 == "\t" || $0 == "\n" || $0 == "\r" }) { skipped.append(path); continue }
         let size = ((try? FileManager.default.attributesOfItem(atPath: host))?[.size] as? NSNumber)?.uint64Value ?? 0
         lines.append("\(path)\t\(host)\t\(size)\n")
     }
@@ -199,6 +200,13 @@ func writeManifest(_ r: ModResolution, to file: URL) throws -> [String] {
     try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
     try lines.joined().data(using: .utf8)!.write(to: file, options: .atomic)
     return skipped
+}
+
+/// A RomFS path the runtime accepts (runtime/romfs_mods.c path_inside): relative, "/"-separated, no empty, "." or ".."
+/// component, no backslash, no tab or line break.
+func romfsPathOK(_ p: String) -> Bool {
+    if p.isEmpty || p.hasPrefix("/") || p.contains(where: { $0 == "\\" || $0 == "\t" || $0 == "\n" || $0 == "\r" }) { return false }
+    return p.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
 }
 
 /// RomFS paths the runtime skipped as new files (the game has no such file), from the game's log.
@@ -263,8 +271,9 @@ func installCommand(project: String, baseCommit: String, patches: [String]) -> S
 
 /// Applies, in order, each patch that is not applied yet (an older install that has only the first one gets the rest).
 func patchesCommand(project: String, patches: [String]) -> String {
-    "set -e; cd \(shQuote(project))" + patches.map { p in
-        "; if ! git apply -p1 --reverse --check \(shQuote(p)) 2>/dev/null; then git apply -p1 \(shQuote(p)); fi"
+    // Chained with && rather than set -e: set -e is ignored inside the left side of upgradeCommand's ||.
+    "cd \(shQuote(project))" + patches.map { p in
+        " && { git apply -p1 --reverse --check \(shQuote(p)) 2>/dev/null || git apply -p1 \(shQuote(p)); }"
     }.joined()
 }
 
@@ -272,3 +281,41 @@ func patchesCommand(project: String, patches: [String]) -> String {
 func patchCheckCommand(project: String, patches: [String]) -> String {
     "cd \(shQuote(project))" + patches.map { " && git apply -p1 --reverse --check \(shQuote($0)) 2>/dev/null" }.joined()
 }
+
+/// Printed by upgradeCommand when it had to install a fresh build tool; the launcher then switches to that folder.
+let freshToolMarker = "SW_FRESH_BUILD_TOOL="
+
+/// Applies the missing patches; when the existing build tool cannot take them (a v1.0.0 install, or a tree with its own
+/// changes), installs a fresh build tool into `fresh` instead and prints freshToolMarker + its path. Never resets `project`.
+func upgradeCommand(project: String, fresh: String, baseCommit: String, patches: [String]) -> String {
+    "( \(patchesCommand(project: project, patches: patches)) ) || ( echo '现有的构建工具无法打上补丁，改为安装一份新的：'\(shQuote(fresh)); " +
+        "\(installCommand(project: fresh, baseCommit: baseCommit, patches: patches)) && echo \(freshToolMarker)\(shQuote(fresh)) )"
+}
+
+// MARK: - Start-up log
+
+/// The file's inode, to tell a new log (the game rotates it on start) from the previous run's.
+func fileIdentity(_ url: URL) -> UInt64? {
+    (try? FileManager.default.attributesOfItem(atPath: url.path))?[.systemFileNumber] as? UInt64
+}
+
+/// The log's text once it is a different file than `before` (nil while it is still the previous run's log).
+func freshLog(_ url: URL, notSameAs before: UInt64?) -> String? {
+    guard let id = fileIdentity(url), id != before, let h = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? h.close() }
+    return String(decoding: h.readData(ofLength: 400_000), as: UTF8.self)
+}
+
+/// A start that failed for a reason retrying will not fix: the message to show, or nil (no failure, or the address-space
+/// reservation failure that the launcher retries).
+func launchFailure(log: String) -> String? {
+    guard let line = log.split(separator: "\n").first(where: { $0.contains("FAIL: ") }),
+          let r = line.range(of: "FAIL: ") else { return nil }   // runtime_fail prints "[totk] FAIL: <message>"
+    let message = line[r.upperBound...]
+    if message.hasPrefix("reserve") { return nil }
+    if message.contains("RomFS mod") { return "Mod 文件在启动器列出之后被改动或删除了。请再点一次“启动”，启动器会重新生成 Mods 清单。" }
+    return "游戏启动失败：" + message
+}
+
+/// Whether a built game app reads the mods manifest (apps built before sw-launcher 1.1.0 ignore it).
+func appSupportsMods(info: [String: Any]) -> Bool { info["SWModsManifest"] as? Bool == true }

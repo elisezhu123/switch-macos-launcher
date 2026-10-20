@@ -1,8 +1,17 @@
 diff --git a/build_app.py b/build_app.py
-index f64610a..ec40e91 100644
+index f64610a..5a3da5b 100644
 --- a/build_app.py
 +++ b/build_app.py
-@@ -453,6 +453,19 @@ static FILE *mng_open_base(const char *path) {
+@@ -36,6 +36,8 @@ VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v143': UPDATED143}
+ HACTOOL = ('https://github.com/SciresM/hactool.git', '1d64a83450e025622f3468c28fc4164dad2c5ef6')
+ APP_NAME = 'Tears of the Kingdom'
+ BUNDLE_ID = 'org.macnativegames.totk'
++# Info.plist keys every built game app carries; sw-launcher reads SWModsManifest to know the app loads RomFS mods.
++APP_INFO_EXTRA = {'SWModsManifest': True}
+ LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
+ # Pinned upstream sources fetched at build time (repository, commit)
+ SPIRV_CROSS = ('https://github.com/KhronosGroup/SPIRV-Cross.git', 'aa217aeb6c9f0ace7a0ab233b28807edf45eb165')
+@@ -453,6 +455,19 @@ static FILE *mng_open_base(const char *path) {
          if text.count(old) != 1:
              raise BuildError('pinned hactool BKTR total-size check changed')
          nca.write_text(text.replace(old, new))
@@ -22,7 +31,25 @@ index f64610a..ec40e91 100644
      config = source/'config.mk'
      if not config.exists():
          shutil.copy2(source/'config.mk.template', config)
-@@ -612,6 +625,7 @@ def step_app(tree, out, logs, *, version="v0"):
+@@ -522,7 +537,7 @@ def step_shaders(tree, logs, *, version='v0'):
+ def step_binary(tree, game, keys, env, logs, *, version="v0"):
+     say('4/4 app: building the game binary and the launcher')
+     run(['make', 'runtime' if version == 'v0' else f'runtime-{version}'], logs / 'runtime.log', cwd=tree, env=env)
+-    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), 'app/launcher.m', '-framework', 'AppKit',
++    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), 'app/launcher.m', 'runtime/romfs_mods.c', '-framework', 'AppKit',
+          '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
+     if not (tree / 'build/AppIcon.icns').exists():   # the game's own icon from its control data; optional
+         try:
+@@ -583,7 +598,7 @@ def step_app(tree, out, logs, *, version="v0"):
+                 CFBundleDisplayName=APP_NAME, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
+                 CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
+                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
+-                GCSupportsControllerUserInteraction=True)
++                GCSupportsControllerUserInteraction=True, **APP_INFO_EXTRA)
+     icon = tree / 'build/AppIcon.icns'
+     if icon.exists():
+         clone(icon, tmp / 'Contents/Resources/AppIcon.icns')
+@@ -612,6 +627,7 @@ def step_app(tree, out, logs, *, version="v0"):
  def parse_args(argv):
      ap = argparse.ArgumentParser(description='Build one native macOS app from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2 or 1.4.3 update.',
                                   epilog='example: python3 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys')
@@ -30,7 +57,7 @@ index f64610a..ec40e91 100644
      ap.add_argument('game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0')
      ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app')
      ap.add_argument('-k', '--keys', type=Path, required=True, help='your prod.keys')
-@@ -625,6 +639,17 @@ def parse_args(argv):
+@@ -625,6 +641,17 @@ def parse_args(argv):
  
  def main(argv):
      args = parse_args(argv)
@@ -146,7 +173,7 @@ index 0000000..9ce979e
 +The output directory must not exist yet.
 diff --git a/games/botw/scripts/build_botw.py b/games/botw/scripts/build_botw.py
 new file mode 100644
-index 0000000..78638c3
+index 0000000..7f8b93e
 --- /dev/null
 +++ b/games/botw/scripts/build_botw.py
 @@ -0,0 +1,227 @@
@@ -296,7 +323,7 @@ index 0000000..78638c3
 +    B.say('4/4 app: building the game binary and the launcher')
 +    B.run(['make', f'runtime-{VERSION}'], logs / 'runtime-botw.log', cwd=tree, env=env)
 +    B.run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', f'-DTOTK_GAME_{VERSION.upper()}=1',
-+           'app/launcher.m', '-framework', 'AppKit', '-o', 'build/app-launcher-botw'], logs / 'launcher-botw.log', cwd=tree, env=env)
++           'app/launcher.m', 'runtime/romfs_mods.c', '-framework', 'AppKit', '-o', 'build/app-launcher-botw'], logs / 'launcher-botw.log', cwd=tree, env=env)
 +    if not (tree / 'build/AppIcon-botw.icns').exists():
 +        try:
 +            B.run([tree / '.venv/bin/python', 'scripts/extract_app_icon.py', game, '--keys', keys, '--output', 'build/AppIcon-botw.icns'],
@@ -322,7 +349,7 @@ index 0000000..78638c3
 +                CFBundleDisplayName=APP_NAME, CFBundlePackageType='APPL', CFBundleShortVersionString=EXPECTED['display_version'],
 +                CFBundleVersion='1', LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
 +                LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
-+                GCSupportsControllerUserInteraction=True)
++                GCSupportsControllerUserInteraction=True, **B.APP_INFO_EXTRA)
 +    icon = tree / 'build/AppIcon-botw.icns'
 +    if icon.exists():
 +        B.clone(icon, tmp / 'Contents/Resources/AppIcon.icns')
@@ -1042,10 +1069,18 @@ index b2cdb42..1dd1ed8 100644
 +	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V190=1 -Ibuild/v190 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches_v190.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/romfs_mods.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
 +runtime-v190: build/totk-native-v190 build/pso_manifest.tsv
 diff --git a/games/totk/app/launcher.m b/games/totk/app/launcher.m
-index 0fe8d52..797e9f2 100644
+index 0fe8d52..613e928 100644
 --- a/games/totk/app/launcher.m
 +++ b/games/totk/app/launcher.m
-@@ -67,14 +67,14 @@ static BOOL make_dir(NSString *path) {
+@@ -15,6 +15,7 @@
+ #include <unistd.h>
+ #include "dmsh_chain.h"   // DMSH_CHAIN: the shader translation chain the cache folder is named after
+ #include "game_version.h"
++#include "romfs_mods.h"
+ 
+ static void show_error(NSString *detail) {
+     NSAlert *alert = [NSAlert new];
+@@ -67,14 +68,14 @@ static BOOL make_dir(NSString *path) {
  int main(int argc, char **argv) {
      @autoreleasepool {
          NSString *root = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"totk"];
@@ -1062,7 +1097,7 @@ index 0fe8d52..797e9f2 100644
              printf("%s: game version %s\n", ok ? "ok" : "missing binary or version mismatch", TOTK_GAME_VERSION);
              return ok ? 0 : 1;
          }
-@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
+@@ -83,7 +84,7 @@ int main(int argc, char **argv) {
              return 1;
          }
          NSString *home = NSHomeDirectory();
@@ -1071,13 +1106,21 @@ index 0fe8d52..797e9f2 100644
          NSString *logs = [home stringByAppendingPathComponent:@"Library/Logs/MacNativeGames"];
          /* Folders the environment already names are kept (open --env TOTK_PROFILE_DIR=... runs a test on a save copy,
             TOTK_GAME_SLOT_DIR shares one game slot with another build of the game: one game at a time on the Mac). */
-@@ -131,15 +131,19 @@ int main(int argc, char **argv) {
+@@ -131,15 +132,27 @@ int main(int argc, char **argv) {
          setenv("TOTK_GPU_BUDGET_MB", "5000", 1);
          setenv("TOTK_SLOT_OWNER", "user", 0);
          setenv("TOTK_SLOT_PURPOSE", "player", 0);
 +        /* RomFS mods: sw-launcher writes <data>/mods.tsv before each start (runtime/romfs_mods.c); no file, no mods. */
 +        { NSString *mods = [data stringByAppendingPathComponent:@"mods.tsv"];
-+          if (access(mods.fileSystemRepresentation, R_OK) == 0) setenv("TOTK_MODS_MANIFEST", mods.fileSystemRepresentation, 1);
++          NSData *manifest = [NSData dataWithContentsOfFile:mods];
++          if (manifest) {   /* a mod file changed since sw-launcher listed it: say so here, the game would only log it */
++              char err[1400];
++              if (mods_manifest_check(manifest.bytes, manifest.length, err, sizeof err)) {
++                  show_error([NSString stringWithFormat:@"Mod 文件在 sw-launcher 列出之后被改动或删除了，请从 sw-launcher 重新启动游戏。\n\n%s", err]);
++                  return 1;
++              }
++              setenv("TOTK_MODS_MANIFEST", mods.fileSystemRepresentation, 1);
++          }
 +          else unsetenv("TOTK_MODS_MANIFEST"); }
          unsetenv("TOTK_AUTOLOAD");   // the game starts at its title screen, as on the console
          /* runtime command channel (runtime/input.c): echo "shot ~/Desktop/shot.png" >> "<data>/input.txt" */
@@ -1413,10 +1456,10 @@ index 4d9a789..f97f249 100644
   for(unsigned k=0;k<noverlay;k++){Entry e=entry(overlays[k].index);char p[4096];need(snprintf(p,sizeof(p),"rom:/%s",entry_name(e))<(int)sizeof(p),"probe overlay path");uint64_t oh=0,n=0;int64_t size=0;uint8_t a[64],b[64];
 diff --git a/games/totk/runtime/romfs_mods.c b/games/totk/runtime/romfs_mods.c
 new file mode 100644
-index 0000000..dc94bfa
+index 0000000..822eec1
 --- /dev/null
 +++ b/games/totk/runtime/romfs_mods.c
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,110 @@
 +/* See romfs_mods.h. */
 +#include "romfs_mods.h"
 +#include <errno.h>
@@ -1514,12 +1557,25 @@ index 0000000..dc94bfa
 +    mods_bound_entry key = {index, 0, -1};
 +    return b->n ? bsearch(&key, b->v, b->n, sizeof *b->v, by_index) : NULL;
 +}
++
++int mods_manifest_check(const char *text, size_t len, char *err, size_t errlen) {
++    mods_t m;
++    if (mods_parse(text, len, &m, err, errlen)) return 1;
++    for (size_t i = 0; i < m.n; i++) {
++        struct stat st;
++        if (stat(m.v[i].host, &st) || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != m.v[i].size) {
++            snprintf(err, errlen, "mod file changed since the launcher listed it: %s (%s)", m.v[i].path, m.v[i].host);
++            mods_free(&m); return 1; }
++    }
++    mods_free(&m);
++    return 0;
++}
 diff --git a/games/totk/runtime/romfs_mods.h b/games/totk/runtime/romfs_mods.h
 new file mode 100644
-index 0000000..cdf0038
+index 0000000..c9e1e09
 --- /dev/null
 +++ b/games/totk/runtime/romfs_mods.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,29 @@
 +/* RomFS mods: files the launcher lists in a manifest replace the game's files of the same RomFS path.
 +   The manifest (TOTK_MODS_MANIFEST, written by sw-launcher before each start) is UTF-8 text, one file per line:
 +   <RomFS path>\t<absolute host path>\t<size in bytes>. A later line for the same path wins (the launcher writes mods in
@@ -1545,6 +1601,10 @@ index 0000000..cdf0038
 +              void *ctx, void (*log)(const char *line, void *ctx), void *log_ctx, mods_bound_t *out, char *err, size_t errlen);
 +const mods_bound_entry *mods_bound_find(const mods_bound_t *b, uint64_t index);
 +void mods_bound_free(mods_bound_t *b);
++
++/* For the in-app launcher before it starts the game: parses the manifest and checks that every listed host file still
++   exists with the listed size. Returns 0, or non-zero with err set. */
++int mods_manifest_check(const char *text, size_t len, char *err, size_t errlen);
 diff --git a/games/totk/runtime/world_survey.c b/games/totk/runtime/world_survey.c
 index dd40706..18226a4 100644
 --- a/games/totk/runtime/world_survey.c
@@ -1705,10 +1765,10 @@ index 87b1ad5..69039b8 100644
  NVN(nvnDeviceFinalizeCommandHandle, void, NVNdevice *d, NVNcommandHandle h) { (void)d; (void)h; }
 diff --git a/tests/test_botw_build_args.py b/tests/test_botw_build_args.py
 new file mode 100644
-index 0000000..efe4fee
+index 0000000..572fdd1
 --- /dev/null
 +++ b/tests/test_botw_build_args.py
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,50 @@
 +"""Argument handling of the BOTW build entry (no game files needed)."""
 +from pathlib import Path
 +import sys
@@ -1751,6 +1811,14 @@ index 0000000..efe4fee
 +        self.assertEqual(r.returncode, 1, r.stderr)
 +        self.assertIn('ERROR: no such file', r.stderr)
 +        self.assertNotIn('Traceback', r.stderr)
++
++
++class AppInfo(unittest.TestCase):
++    def test_apps_declare_mods_support(self):
++        """sw-launcher tells a pre-mods app (no SWModsManifest key) from a new one."""
++        self.assertEqual(build_app.APP_INFO_EXTRA, {'SWModsManifest': True})
++        self.assertIn('**B.APP_INFO_EXTRA', (ROOT / 'games/botw/scripts/build_botw.py').read_text())
++        self.assertIn('**APP_INFO_EXTRA', (ROOT / 'build_app.py').read_text())
 diff --git a/tests/test_botw_romfs_damage.py b/tests/test_botw_romfs_damage.py
 new file mode 100644
 index 0000000..af8a7ec
@@ -1849,10 +1917,10 @@ index 0000000..83bae90
 +    unittest.main()
 diff --git a/tests/test_romfs_mods.c b/tests/test_romfs_mods.c
 new file mode 100644
-index 0000000..4c89c80
+index 0000000..1aeea6b
 --- /dev/null
 +++ b/tests/test_romfs_mods.c
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,77 @@
 +/* RomFS mods manifest (games/totk/runtime/romfs_mods.c), without game files. */
 +#include "../games/totk/runtime/romfs_mods.h"
 +#include <stdio.h>
@@ -1917,6 +1985,13 @@ index 0000000..4c89c80
 +    /* paths must stay inside the RomFS */
 +    snprintf(text, sizeof text, "../etc/passwd\t%s\t10\n", a);
 +    CHECK(mods_parse(text, strlen(text), &m, err, sizeof err) != 0);
++
++    /* test_manifest_check (the in-app launcher's check before starting the game) */
++    snprintf(text, sizeof text, "Actor/A.bin\t%s\t10\nNew/x\t%s\t20\n", a, b);
++    CHECK(mods_manifest_check(text, strlen(text), err, sizeof err) == 0);
++    snprintf(text, sizeof text, "Actor/A.bin\t%s\t10\nNew/x\t%s\t21\n", a, b);
++    CHECK(mods_manifest_check(text, strlen(text), err, sizeof err) != 0);
++    CHECK(strstr(err, "mod file changed since the launcher listed it: New/x") != NULL);
 +
 +    unlink(a); unlink(b); rmdir(dir);
 +    if (failed) return 1;

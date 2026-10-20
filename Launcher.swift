@@ -195,7 +195,7 @@ final class Model: ObservableObject {
             Dep(id: "project", title: "构建工具（MacNativeGames）", detail: project, size: "约 50 MB", required: true,
                 install: .background(projectInstallCommand(project))),
             Dep(id: "patch", title: "Mac 兼容补丁与旷野之息移植", detail: "内存布局回退、并行预热、预编译着色器、语言设置；旷野之息移植和 Mods。已装过旧版构建工具时，点安装只补打缺少的补丁", size: nil, required: true,
-                install: .background(patchesCommand(project: project, patches: Model.patchPaths))),
+                install: .background(upgradeCommand(project: project, fresh: project + "-sw-launcher", baseCommit: baseCommit, patches: Model.patchPaths))),
             Dep(id: "xcode", title: "Xcode（完整版）", detail: "下载 Metal Toolchain 需要", size: "约 7 GB", required: false,
                 install: .link("macappstore://apps.apple.com/app/xcode/id497799835")),
             Dep(id: "metal", title: "Metal Toolchain", detail: "预编译着色器，缓存不会被系统清掉，启动快几十倍", size: "839 MB", required: false,
@@ -257,6 +257,11 @@ final class Model: ObservableObject {
                     }
                 }
                 await MainActor.run {
+                    // The old build tool could not take the patches and a fresh one was installed next to it: use that one.
+                    if status == 0, let m = lastMatch(NSRegularExpression.escapedPattern(for: freshToolMarker) + "(.+)", in: buffer) {
+                        self.s.projectDir = m[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                        self.notice = "原来的构建工具打不上新补丁，已在 \(self.s.projectDir) 装好一份新的，并改用它。"
+                    }
                     if let j = self.deps.firstIndex(where: { $0.id == id }) {
                         self.deps[j].state = status == 0 ? .checking : .failed("安装没有成功，详情见日志")
                     }
@@ -433,28 +438,36 @@ final class Model: ObservableObject {
         case .idle: break
         }
         applyLanguage()
-        let problem = syncModsManifest()
+        var problem = syncModsManifest()
+        if FileManager.default.fileExists(atPath: paths.modsManifest.path),
+           let info = NSDictionary(contentsOfFile: (s.outputApp as NSString).expandingTildeInPath + "/Contents/Info.plist") as? [String: Any],
+           !appSupportsMods(info: info) {
+            problem = "这个 App 是旧版启动器构建的，不会加载 Mods；重新构建一次后 Mods 才会生效。"
+        }
         launching = true; notice = problem ?? "正在启动…"
         let app = (s.outputApp as NSString).expandingTildeInPath, log = paths.log
         Task {
-            let ok = await Task.detached { () -> Bool in
+            let (ok, failure) = await Task.detached { () -> (Bool, String?) in
                 for attempt in 1...6 {
                     // A failed attempt exits by itself; wait until its slot is free instead of killing anything.
                     for _ in 0..<20 { if case .idle = runState(for: game, home: Paths.home) { break }; try? await Task.sleep(nanoseconds: 500_000_000) }
-                    _ = sh("/usr/bin/open -n '\(app.replacingOccurrences(of: "'", with: "'\\''"))'")
-                    for _ in 0..<30 {
+                    let before = fileIdentity(log)   // the game rotates its log on start: read only the new one
+                    _ = sh("/usr/bin/open -n \(shQuote(app))")
+                    var retry = false
+                    for _ in 0..<40 {
                         try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        let head = (try? FileHandle(forReadingFrom: log))?.readData(ofLength: 400_000) ?? Data()
-                        let text = String(decoding: head, as: UTF8.self)
-                        if text.contains("FAIL: reserve") { break }   // address space was not free this time: try again
-                        if text.contains("window visible") || text.contains("启动关键管线已就绪") { return true }
+                        guard let text = freshLog(log, notSameAs: before) else { continue }
+                        if let message = launchFailure(log: text) { return (false, message) }   // retrying will not help
+                        if text.contains("FAIL: reserve") { retry = true; break }   // address space was not free this time
+                        if text.contains("window visible") || text.contains("启动关键管线已就绪") { return (true, nil) }
                     }
+                    if !retry, case .running = runState(for: game, home: Paths.home) { return (true, nil) }   // still starting up
                     await MainActor.run { self.notice = "第 \(attempt) 次启动没成功，自动重试…" }
                 }
-                return false
+                return (false, nil)
             }.value
             self.launching = false
-            self.notice = ok ? "游戏已启动。" : "多次尝试仍未启动，请查看日志 ~/Library/Logs/MacNativeGames/\(game.logName).log"
+            self.notice = ok ? (problem ?? "游戏已启动。") : (failure ?? "多次尝试仍未启动，请查看日志 ~/Library/Logs/MacNativeGames/\(game.logName).log")
         }
     }
 
