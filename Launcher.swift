@@ -161,6 +161,8 @@ final class Model: ObservableObject {
     @Published var launching = false
     @Published var shaderSources = 0
     @Published var shaderBaked = 0
+    @Published var modList: [ModInfo] = []
+    @Published var modWarnings: [String] = []
 
     static let initialTab: Int = {
         let a = CommandLine.arguments
@@ -425,6 +427,7 @@ final class Model: ObservableObject {
     func launch() {
         guard !launching else { return }
         applyLanguage()
+        if let problem = syncModsManifest() { notice = problem }
         launching = true; notice = "正在启动…"
         let app = (s.outputApp as NSString).expandingTildeInPath, log = paths.log
         Task {
@@ -538,6 +541,36 @@ extension Model {
     func openFolder(_ url: URL) {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         NSWorkspace.shared.open(url)
+    }
+
+    // MARK: mods
+
+    var modsDir: URL? { s.mods.isEmpty ? nil : URL(fileURLWithPath: (s.mods as NSString).expandingTildeInPath) }
+
+    func refreshMods() {
+        modList = modsDir.map { orderedMods(scanMods(dir: $0, titleID: s.selected.titleID), order: s.current.modOrder) } ?? []
+        let log = (try? String(contentsOf: paths.log, encoding: .utf8)) ?? ""
+        modWarnings = parseModWarnings(log: log)
+    }
+    func modEnabled(_ name: String) -> Bool { s.current.modsEnabled[name] ?? true }
+    func setMod(_ name: String, enabled: Bool) { s.current.modsEnabled[name] = enabled }
+    func moveMod(_ name: String, by delta: Int) {
+        var names = modList.map(\.name)
+        guard let i = names.firstIndex(of: name), names.indices.contains(i + delta) else { return }
+        names.swapAt(i, i + delta)
+        s.current.modOrder = names
+        refreshMods()
+    }
+    var modResolution: ModResolution { resolveMods(modList, order: s.current.modOrder, enabled: s.current.modsEnabled) }
+    func conflictCount(_ name: String) -> Int { modResolution.conflicts.values.filter { $0.contains(name) }.count }
+
+    /// Before each start: the selected game's <data>/mods.tsv from the enabled mods (removed when there are none).
+    func syncModsManifest() -> String? {
+        refreshMods()
+        do {
+            let skipped = try writeManifest(modsDir == nil ? ModResolution() : modResolution, to: paths.modsManifest)
+            return skipped.isEmpty ? nil : "有 \(skipped.count) 个 mod 文件名里含制表符或换行，已跳过。"
+        } catch { return "无法写入 Mods 清单：\(error.localizedDescription)" }
     }
 
     func addGame(from url: URL) {
@@ -1087,7 +1120,7 @@ struct SettingsView: View {
 
     var extrasTab: some View {
         pane {
-            gamePicker
+            gamePicker.onChange(of: model.s.selected) { model.refreshMods() }.onAppear { model.refreshMods() }
             PathRow(title: "存档", tag: .optional, value: $model.s.save, check: model.check(.save)) {
                 if let p = model.pick(directory: true, title: "选择存档文件夹") { model.s.save = p }
             }
@@ -1097,12 +1130,33 @@ struct SettingsView: View {
             }
             Text("导入前会自动备份现有存档。第一次需要先启动一次游戏，让它创建存档目录。").font(.system(size: 11)).foregroundStyle(.secondary)
             Divider()
-            HStack(spacing: 6) { Text("Mods").font(.system(size: 13, weight: .medium)); TagView(kind: .inactive) }
+            Text("Mods（RomFS 替换）").font(.system(size: 13, weight: .medium))
             HStack(spacing: 8) {
                 TextField("选择…", text: $model.s.mods).textFieldStyle(.roundedBorder).font(.system(size: 12))
-                Button("选择…") { if let p = model.pick(directory: true, title: "选择 Mods 文件夹") { model.s.mods = p } }
+                Button("选择…") { if let p = model.pick(directory: true, title: "选择 Mods 文件夹") { model.s.mods = p; model.refreshMods() } }
+                Button("刷新") { model.refreshMods() }
             }
-            Text("当前版本的游戏运行时还没有 Mods 加载器，这里的路径只会被保存，不会被应用。").font(.system(size: 11)).foregroundStyle(.secondary)
+            if model.modList.isEmpty {
+                Text(model.s.mods.isEmpty ? "选择一个 Mods 文件夹。" : "这个文件夹里没有找到 mod（需要 <mod>/romfs/… 或 contents/\(model.s.selected.titleID)/<mod>/romfs/…）。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(model.modList.enumerated()), id: \.element.name) { i, m in
+                        HStack(spacing: 8) {
+                            Toggle("", isOn: Binding(get: { model.modEnabled(m.name) }, set: { model.setMod(m.name, enabled: $0) })).labelsHidden().toggleStyle(.switch).controlSize(.mini).tint(accent)
+                            Text(m.name).font(.system(size: 12)).lineLimit(1)
+                            Spacer()
+                            let c = model.modEnabled(m.name) ? model.conflictCount(m.name) : 0
+                            Text("\(m.files.count) 个文件").font(.system(size: 11)).foregroundStyle(.secondary)
+                            if c > 0 { Text("\(c) 个冲突").font(.system(size: 11)).foregroundStyle(.orange).help(model.modResolution.conflicts.filter { $0.value.contains(m.name) }.keys.sorted().prefix(20).joined(separator: "\n")) }
+                            if m.files.contains(where: model.modWarnings.contains) { Text("含新增文件，不支持").font(.system(size: 11)).foregroundStyle(.orange) }
+                            Button { model.moveMod(m.name, by: -1) } label: { Image(systemName: "chevron.up") }.buttonStyle(.borderless).disabled(i == 0)
+                            Button { model.moveMod(m.name, by: 1) } label: { Image(systemName: "chevron.down") }.buttonStyle(.borderless).disabled(i == model.modList.count - 1)
+                        }.padding(.vertical, 4)
+                    }
+                }
+            }
+            Text("只支持替换游戏里已有的文件（romfs 文件夹）。多个 mod 改了同一个文件时，列表里靠下的生效。改动在下次启动时生效，不用重新构建。暂不支持 ExeFS 补丁和金手指。").font(.system(size: 11)).foregroundStyle(.secondary)
         }
     }
 
@@ -1204,5 +1258,7 @@ extension Model {
         deps = Model.makeDeps(project: s.projectDir)
         for i in deps.indices { deps[i].state = .ok }
         shaderSources = 8652; shaderBaked = 8652
+        s.mods = NSTemporaryDirectory() + "sw-demo-mods"   // sample mods for the screenshots, if that folder exists
+        refreshMods()
     }
 }

@@ -110,3 +110,102 @@ struct LauncherSettings: Codable {
     var outputApp: String { get { current.outputApp } set { current.outputApp = newValue } }
     var workDir: String { get { current.workDir } set { current.workDir = newValue } }
 }
+
+// MARK: - RomFS mods
+
+/// One mod: `root` is its romfs/ folder, `files` the RomFS-relative paths inside it ("/"-separated, sorted).
+struct ModInfo: Equatable {
+    let name: String
+    let root: URL
+    let files: [String]
+}
+
+/// Mods in `<dir>/<mod>/romfs/...` and in Ryujinx's `<dir>/contents/<title ID>/<mod>/romfs/...` (only this game's ID).
+func scanMods(dir: URL, titleID: String) -> [ModInfo] {
+    let fm = FileManager.default
+    func folders(_ u: URL) -> [URL] {
+        ((try? fm.contentsOfDirectory(at: u, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? [])
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+    func files(in romfs: URL) -> [String] {
+        guard let e = fm.enumerator(at: romfs, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else { return [] }
+        let base = romfs.standardizedFileURL.path + "/"
+        var out: [String] = []
+        for case let u as URL in e where (try? u.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+            let p = u.standardizedFileURL.path
+            if p.hasPrefix(base) { out.append(String(p.dropFirst(base.count))) }
+        }
+        return out.sorted()
+    }
+    var mods: [ModInfo] = []
+    func add(_ modDir: URL) {
+        let romfs = modDir.appendingPathComponent("romfs")
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: romfs.path, isDirectory: &isDir), isDir.boolValue else { return }
+        var name = modDir.lastPathComponent
+        if mods.contains(where: { $0.name == name }) { name += "（contents）" }
+        mods.append(ModInfo(name: name, root: romfs, files: files(in: romfs)))
+    }
+    for d in folders(dir) where d.lastPathComponent != "contents" { add(d) }
+    for t in folders(dir.appendingPathComponent("contents")) where t.lastPathComponent.uppercased() == titleID.uppercased() {
+        for d in folders(t) { add(d) }
+    }
+    return mods
+}
+
+/// The mods in load order: the names in `order` first (in that order), then the others by name.
+func orderedMods(_ mods: [ModInfo], order: [String]) -> [ModInfo] {
+    let listed = order.compactMap { n in mods.first { $0.name == n } }
+    return listed + mods.filter { !order.contains($0.name) }.sorted { $0.name < $1.name }
+}
+
+struct ModResolution {
+    /// RomFS path -> the mod that supplies it and the file.
+    var winners: [String: (mod: String, file: URL)] = [:]
+    /// RomFS path -> every enabled mod that has it, in load order (only paths with two or more).
+    var conflicts: [String: [String]] = [:]
+}
+
+/// Enabled mods (missing from `enabled` = on) in load order; a later mod wins a path.
+func resolveMods(_ mods: [ModInfo], order: [String], enabled: [String: Bool]) -> ModResolution {
+    var r = ModResolution(), owners: [String: [String]] = [:]
+    for m in orderedMods(mods, order: order) where enabled[m.name] ?? true {
+        for f in m.files {
+            r.winners[f] = (m.name, m.root.appendingPathComponent(f))
+            owners[f, default: []].append(m.name)
+        }
+    }
+    r.conflicts = owners.filter { $0.value.count > 1 }
+    return r
+}
+
+/// Writes the runtime's manifest (`<RomFS path>\t<host path>\t<size>`, runtime/romfs_mods.h), sorted by path; removes it
+/// when no file is left. Returns the RomFS paths skipped because a path contains a tab or a line break.
+@discardableResult
+func writeManifest(_ r: ModResolution, to file: URL) throws -> [String] {
+    var lines: [String] = [], skipped: [String] = []
+    for path in r.winners.keys.sorted() {
+        let host = r.winners[path]!.file.path
+        if (path + host).contains(where: { $0 == "\t" || $0 == "\n" || $0 == "\r" }) { skipped.append(path); continue }
+        let size = ((try? FileManager.default.attributesOfItem(atPath: host))?[.size] as? NSNumber)?.uint64Value ?? 0
+        lines.append("\(path)\t\(host)\t\(size)\n")
+    }
+    let fm = FileManager.default
+    if lines.isEmpty {
+        if fm.fileExists(atPath: file.path) { try fm.removeItem(at: file) }
+        return skipped
+    }
+    try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try lines.joined().data(using: .utf8)!.write(to: file, options: .atomic)
+    return skipped
+}
+
+/// RomFS paths the runtime skipped as new files (the game has no such file), from the game's log.
+func parseModWarnings(log: String) -> [String] {
+    let prefix = "[totk] mod: ", suffix = " not in the game (new files are not supported)"
+    return log.split(separator: "\n").compactMap { line in
+        guard line.hasPrefix(prefix), line.hasSuffix(suffix) else { return nil }
+        return String(line.dropFirst(prefix.count).dropLast(suffix.count))
+    }
+}
