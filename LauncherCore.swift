@@ -246,3 +246,29 @@ func runState(for game: GameKind, home: URL) -> RunState {
     }
     return .idle
 }
+
+// MARK: - Build tool installation
+
+/// Single-quoted for /bin/sh.
+func shQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+
+/// A fresh build tool: the pinned upstream commit with every patch applied in order (stops if `project` is not empty).
+func installCommand(project: String, baseCommit: String, patches: [String]) -> String {
+    let d = shQuote(project)
+    return "set -e; if [ -e \(d) ] && [ -n \"$(ls -A \(d) 2>/dev/null)\" ]; then echo \"目录已存在且不是空的：\"\(d); exit 1; fi; " +
+        "mkdir -p \(d) && cd \(d) && git init -q && git remote add origin https://github.com/ly05010419/MacNativeGames && " +
+        "git fetch --depth 1 origin \(baseCommit) && git checkout -q FETCH_HEAD" +
+        patches.map { " && git apply -p1 \(shQuote($0))" }.joined()
+}
+
+/// Applies, in order, each patch that is not applied yet (an older install that has only the first one gets the rest).
+func patchesCommand(project: String, patches: [String]) -> String {
+    "set -e; cd \(shQuote(project))" + patches.map { p in
+        "; if ! git apply -p1 --reverse --check \(shQuote(p)) 2>/dev/null; then git apply -p1 \(shQuote(p)); fi"
+    }.joined()
+}
+
+/// Exit status 0 when every patch is applied.
+func patchCheckCommand(project: String, patches: [String]) -> String {
+    "cd \(shQuote(project))" + patches.map { " && git apply -p1 --reverse --check \(shQuote($0)) 2>/dev/null" }.joined()
+}

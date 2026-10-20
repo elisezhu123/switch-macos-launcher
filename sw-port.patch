@@ -1,0 +1,1958 @@
+diff --git a/build_app.py b/build_app.py
+index f64610a..ec40e91 100644
+--- a/build_app.py
++++ b/build_app.py
+@@ -453,6 +453,19 @@ static FILE *mng_open_base(const char *path) {
+         if text.count(old) != 1:
+             raise BuildError('pinned hactool BKTR total-size check changed')
+         nca.write_text(text.replace(old, new))
++    # Report every bad IVFC block instead of stopping at the first one, so a merge can be judged per RomFS file
++    # (games/botw/scripts/romfs_damage.py). The level still reports FAIL, so nothing that checks the result changes.
++    text = nca.read_text()
++    old = ('            result = VALIDITY_INVALID;\n'
++           '            break;\n')
++    new = ('            result = VALIDITY_INVALID;\n'
++           '            { bktr_relocation_entry_t *mng_r = ctx->type == BKTR && ctx->bktr_ctx.relocation_block ? bktr_get_relocation(ctx->bktr_ctx.relocation_block, ofs + data_ofs) : NULL;\n'
++           '              fprintf(stderr, "MNG_BADBLOCK data_ofs=%llx ofs=%llx len=%llx src=%s\\n", (unsigned long long)data_ofs, (unsigned long long)ofs, (unsigned long long)read_size,\n'
++           '                      mng_r ? (mng_r->is_patch ? "PATCH" : "BASE") : "NONE"); }\n')
++    if new not in text:
++        if text.count(old) != 1:
++            raise BuildError('pinned hactool hash-check loop changed')
++        nca.write_text(text.replace(old, new))
+     config = source/'config.mk'
+     if not config.exists():
+         shutil.copy2(source/'config.mk.template', config)
+@@ -612,6 +625,7 @@ def step_app(tree, out, logs, *, version="v0"):
+ def parse_args(argv):
+     ap = argparse.ArgumentParser(description='Build one native macOS app from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2 or 1.4.3 update.',
+                                  epilog='example: python3 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys')
++    ap.add_argument('--title', choices=('totk', 'botw'), default='totk', help='which game to build (botw: Breath of the Wild 1.9.0, experimental; see games/botw)')
+     ap.add_argument('game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0')
+     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app')
+     ap.add_argument('-k', '--keys', type=Path, required=True, help='your prod.keys')
+@@ -625,6 +639,17 @@ def parse_args(argv):
+ 
+ def main(argv):
+     args = parse_args(argv)
++    if args.title == 'botw':
++        sys.path.insert(0, str(REPO / 'games/botw/scripts'))
++        import build_botw
++        rest = list(argv)
++        if '--title' in rest:
++            i = rest.index('--title'); del rest[i:i + 2]
++        rest = [a for a in rest if not a.startswith('--title=')]
++        try:
++            return build_botw.main(build_botw.parse_args(rest))
++        except build_botw.B.BuildError as e:   # build_botw imports this file as build_app, a different module than __main__
++            raise BuildError(str(e)) from None
+     game, keys = args.game.expanduser().resolve(), args.keys.expanduser().resolve()
+     if not game.is_file():
+         raise BuildError(f'no such file: {game}')
+diff --git a/games/botw/README.md b/games/botw/README.md
+new file mode 100644
+index 0000000..9ce979e
+--- /dev/null
++++ b/games/botw/README.md
+@@ -0,0 +1,90 @@
++# BOTW (work in progress)
++
++Native Apple-silicon port of The Legend of Zelda: Breath of the Wild, following the same route as `../totk`
++(see the `ns-game-apple-arm-port` skill). Nothing from the game is stored here. Generated data lives outside the
++repository (see the project `AGENTS.md`).
++
++## Status
++
++The game boots and renders its opening (see First runs). The rest of this section covers extraction, rewriting and compile/link.
++
++- Version 1.9.0 is identified from verified ExeFS hashes (`versions.json`), not from file names.
++- `scripts/extract_exefs.py` reads the 1.9.0 update NSP in place and verifies the ExeFS hash blocks. It matches an
++  independent hactool extraction.
++- `sdk` and `subsdk0` are byte-identical to TOTK 1.4.3, and so are their rewrites. The NPDM lists the same 49 services.
++  Only `main` is BOTW-specific.
++- `main` rewrites with `third_party/d2r/patch_nso.py` after three BOTW-only signed jump tables were registered
++  (build ID `cd57b23fa4bbad65803d9788c01821ee`, sites `0x37df10`, `0x37ee84`, `0x37fdbc`). TOTK's `main` output is unchanged.
++- `scripts/prepare_runtime.py --version v190 --data-root <dir>` and `scripts/prepare_romfs_backend.py --version v190 --data-root <dir>`
++  generate the runtime tables and RomFS config outside the repository. The TOTK v143 outputs are byte-identical.
++- `runtime/game_patches_v190.c` is a baseline with no game patches (shipping speed and output size) and
++  `game_version.h` has a `TOTK_GAME_V190` branch whose TOTK addresses are sentinels, so any use fails loudly.
++- `scripts/build_native.sh <data-root> <output-dir> <fonts-config-dir>` compiles and links `botw-native-v190` outside the
++  repository. It has not been executed.
++
++## Known defect in the RomFS used so far
++
++The RomFS built from the available base game and 1.9.0 update does not pass the IVFC integrity check. The base game
++alone verifies cleanly (880,128 blocks, 0 bad; its Program NCA hash matches its name). The merged image has exactly one
++bad 1 MiB region (65 blocks), and every bad block comes from the update package: update NSP file offset
++`0x86fe990`-`0x8802990`. It lies inside one file, `Sound/Resource/Stream/Event_BGM_CompleteMasterSword.bfstm`, about
++82 % of it. The other 41,061 files verify. The update's Program NCA hash also does not match its file name.
++
++The image is marked `UNVERIFIED` in its folder. The runtime's own RomFS check compares the image against its own hash, so
++it cannot detect this. Replace the update package with a clean copy and rebuild before treating any result as final.
++
++## First runs (macOS, Apple M1 Max)
++
++All runs used the RomFS above and a data tree outside the repository. Evidence is local logs, not a finished port.
++
++- `probe` passes: three rewritten modules load, 223,994 relative relocations apply, 4,000 cross-module clock calls on 4 threads.
++- `probe-fs` passes on the unverified RomFS (41,062 files; its integrity check compares the image to its own hash and
++  cannot see the damaged 1 MiB). `probe-gpu-blockrt`, `probe-gpu-midclear` and `probe-gpu-widen` pass, which opens the
++  matching `TOTK_GPU_*` gates the game now needs.
++- `boot` runs the game's own startup: `nnosInitialize`, SDK startup, all constructors (`main` 1040, `subsdk0` 45, `sdk` 83),
++  `nnMain`, a window, DualSense input, audio output, and several thousand frames of rendering with real shader translation.
++- Magenta frame fixed (2026-10-20): BOTW never calls `nvnDeviceSetDepthMode` and relies on NVN's default,
++  `NEAR_IS_MINUS_W` (enum 0). The runtime's flag `g_depth_near_minus_w` (`hle_nvn.c`) started at 0, so BOTW's vertex
++  shaders were translated without the GL -> Metal clip-z conversion. TOTK is not affected because it sets the same mode
++  explicitly. `nvnDeviceInitialize` now sets the NVN default. With the fix the window shows the opening light flare
++  at 20 s and Link lying in the Shrine of Resurrection at 75 s (screenshots outside the repository).
++  How it was found: the last draw of every frame is a full-screen quad (vertices +-0.5, u16 indices 0,2,1,1,2,3) into the
++  swapchain texture. Its vertex shader multiplies by a constant buffer matrix that scales x and y by 2 and sets **z = -1**.
++  Metal clips z < 0, so the whole quad was discarded and the swapchain texture kept its initial 255,0,255. The evidence:
++  the draw is encoded every frame with no skip counter, and its indices are correct on the CPU side and also when copied
++  into the arena. A runtime-owned full-screen green triangle encoded in the same pass lands at 100 %. The grid VS
++  (`TOTK_GPU_HILITE_VS=1`, no inputs) with a solid fragment shader lands its tile, but the game's own VS does not.
++  **Translated shader variants are not keyed on the depth flag** (`totk_shader_rt.m`: the variant hash covers only the
++  answers). So a BOTW shader cache made before this fix keeps the unconverted vertex shaders. Delete it, or point
++  `TOTK_SHADER_CACHE` at an empty directory. The verification run used a fresh cache.
++  Ruled out on the way (kept for reference): window occlusion, missing RomFS files, shader translation failures, face
++  culling and winding, the render-encode thread, the sRGB view (`fmt 71` over `fmt 70`) of the swapchain texture, and the
++  present path. A TOTK control run on the same Mac rendered correctly.
++- Still open after the fix: the shrine scene is very dark and Link looks like a flat silhouette, so lighting or
++  material passes may still be wrong. The scene buffer that looked uniformly cream earlier is the opening flash.
++- Host calls BOTW makes that TOTK never did were added as local implementations: seven-six-axis sensor lifecycle (no
++  samples), `SetGyroscopeZeroDriftMode`, `SetNpadJoyAssignmentModeDual`, the one-argument `ShowControllerSupport`,
++  `IAudioRenderer` commands 12/13 (voice drop parameter), `nn::account::ListAllUsers`, `nn::fs::CommitSaveData`,
++  `nn::pl::IsRunningOnOunce` (reports not Switch 2), `IsVrMode`/`EndVrMode`/`BeginVrMode` (Begin stops loudly) and
++  `nn::oe::EnableRecording`. Controls the host cannot provide report that plainly.
++- Reserving the guest address space fails about one run in three on this Mac when the window is created at the same time.
++  `services.c` has someone else's uncommitted work on exactly this, so it was not touched; `TOTK_ALIAS_GIB=12` was used.
++- The runtime looks for its helpers under `<parent of the executable's folder>/build/`: `shader-service/totk_xlate` (the
++  checked-in prebuilt) and `spirv-cross/spirv-cross` (built by `build_app.py`).
++
++## Not done
++
++- BOTW-specific game patches: frame rate and output size. TOTK's adaptive present-interval patches have no counterpart
++  in BOTW's `main`. The present interval is read from a config field (`this+0xa0`, `main+0xe93dbc`), and the frame budget
++  is `(interval + 0.02) / 60` seconds (`main+0xe93df4`). Where the default of 2 is set, and whether game logic follows
++  measured frame time, is unknown.
++- Replacements for TOTK's loader checkpoints, the keyboard PLT/GOT offsets and the save-load crash workaround.
++- Shader seed, app bundle, signing, launcher, gamepad checks, and any run of the game.
++
++## Extract
++
++```sh
++python3 games/botw/scripts/extract_exefs.py <BOTW 1.9.0 update.nsp> --keys <prod.keys> --update --output <dir outside the repo>/exefs
++```
++
++The output directory must not exist yet.
+diff --git a/games/botw/scripts/build_botw.py b/games/botw/scripts/build_botw.py
+new file mode 100644
+index 0000000..78638c3
+--- /dev/null
++++ b/games/botw/scripts/build_botw.py
+@@ -0,0 +1,227 @@
++#!/usr/bin/env python3
++"""Build one native macOS app of The Legend of Zelda: Breath of the Wild 1.9.0 (experimental).
++
++Called by build_app.py --title botw. It prints the same "n/4 step" progress lines as the TOTK build, so the launcher
++shows both the same way. The work folder holds a copy of games/totk (the shared runtime) with BOTW's generated data
++in it (extracted/v190, rewritten/v190, build/v190), separate from any TOTK work folder.
++"""
++import argparse
++import json
++import os
++from pathlib import Path
++import plistlib
++import shutil
++import subprocess
++import sys
++import time
++
++HERE = Path(__file__).resolve().parent
++REPO = HERE.parents[2]
++sys.path.insert(0, str(REPO))
++import build_app as B  # noqa: E402
++
++VERSION = 'v190'
++INFO = json.loads((HERE.parent / 'versions.json').read_text())
++EXPECTED = INFO['versions'][VERSION]
++APP_NAME = 'Breath of the Wild'
++BUNDLE_ID = 'org.macnativegames.botw'
++EXECUTABLE = 'BOTW'
++
++
++def parse_args(argv):
++    ap = argparse.ArgumentParser(prog='build_app.py --title botw',
++                                 description='Build one native macOS app from BOTW (base NSP) and its 1.9.0 update NSP.')
++    ap.add_argument('game', type=Path, help='the base game NSP')
++    ap.add_argument('--update', type=Path, help='the 1.9.0 update NSP (required)')
++    ap.add_argument('-k', '--keys', type=Path, required=True, help='your prod.keys')
++    ap.add_argument('-o', '--out', type=Path, help=f'the app to write (default: "{APP_NAME}.app" next to the game file)')
++    ap.add_argument('--work', type=Path, help='work folder (default: BOTW_build next to the game file)')
++    fonts = ap.add_mutually_exclusive_group()
++    fonts.add_argument('--firmware', type=Path, help='unpacked firmware NCA directory providing the shared fonts')
++    fonts.add_argument('--shared-fonts', type=Path, help='previously extracted shared-font directory')
++    args = ap.parse_args(argv)
++    if not args.update:
++        raise SystemExit('BOTW needs the 1.9.0 update: pass --update <update NSP> (the base game alone is not supported)')
++    return args
++
++
++def step_code(tree, update, keys, env, logs):
++    py = tree / '.venv/bin/python'
++    exefs = tree / f'extracted/{VERSION}/exefs'
++    want = EXPECTED['exefs_sha256']
++    if not all((exefs / n).is_file() and B.sha256(exefs / n) == h for n, h in want.items()):
++        B.say('1/4 code: extracting the ExeFS from the update')
++        if exefs.exists():
++            shutil.rmtree(exefs)
++        B.run([py, HERE / 'extract_exefs.py', update, '--keys', keys, '--update', '--output', exefs],
++              logs / 'extract_exefs-botw.log', cwd=tree)
++    for n, h in want.items():
++        if not (exefs / n).is_file() or B.sha256(exefs / n) != h:
++            raise B.BuildError(f'unsupported BOTW version: ExeFS {n} is not 1.9.0 (only 1.9.0 is supported)')
++    if not (tree / f'extracted/{VERSION}/elf/main-inventory.json').exists():
++        B.run([py, 'scripts/prepare_modules.py', exefs, '--output', tree / f'extracted/{VERSION}/elf'],
++              logs / 'prepare_modules-botw.log', cwd=tree)
++    out = tree / f'rewritten/{VERSION}'
++    out.mkdir(parents=True, exist_ok=True)
++    for name in ('sdk', 'subsdk0', 'main'):
++        image, h = out / f'{name}.patched.bin', EXPECTED['rewritten_sha256'][f'{name}.patched.bin']
++        if image.exists() and B.sha256(image) == h:
++            continue
++        B.say(f'1/4 code: rewriting {name} for Apple silicon' + (' (the big one: about a minute)' if name == 'main' else ''))
++        B.run([py, 'third_party/d2r/patch_nso.py', exefs / name, out, name], logs / f'rewrite_{VERSION}_{name}.log', cwd=tree,
++              env=dict(env, DM_RULESET='native', DM_PRIVATE_GATES='0'))
++        B.check(f'rewritten {name}', B.sha256(image), h)
++    report = dict(format=1, status='pass', rom_version=VERSION, scope='hash match with the BOTW 1.9.0 rewrite',
++                  module_file_sha256={**{f'extracted/{VERSION}/exefs/{n}': want[n] for n in ('main', 'sdk', 'subsdk0')},
++                                      **{f'rewritten/{VERSION}/{n}.patched.bin': EXPECTED['rewritten_sha256'][f'{n}.patched.bin']
++                                         for n in ('main', 'sdk', 'subsdk0')}})
++    path = tree / f'analysis/{VERSION}-port/phase12-validation.json'
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(report, indent=2) + '\n')
++
++
++def step_data(tree, game, update, keys, logs, firmware, shared_fonts):
++    py = tree / '.venv/bin/python'
++    folder = tree / f'extracted/{VERSION}/romfs'
++    index = folder / 'index.json'
++    valid = False
++    if index.is_file() and (folder / 'romfs.bin').is_file():
++        try:
++            report = json.loads(index.read_text())
++            valid = report.get('status') == 'pass' and (folder / 'romfs.bin').stat().st_size == report['romfs_size']
++        except (ValueError, KeyError):
++            pass
++    if not valid:
++        hactool = B.build_hactool(tree, logs)
++        if folder.exists():
++            shutil.rmtree(folder)
++        B.say('2/4 data: merging the base game and the 1.9.0 update, verifying every IVFC block (a few minutes)')
++        log = logs / 'update-romfs-botw.log'
++        try:
++            B.run([py, HERE / 'extract_update_romfs.py', game, update, '--keys', keys, '--hactool', hactool, '--output', folder],
++                  log, cwd=tree)
++        except B.BuildError:
++            reason = next((l for l in reversed(log.read_text(errors='replace').splitlines()) if 'RomFS damage' in l or 'failed' in l), '')
++            raise B.BuildError(f'the game data did not verify. {reason.strip()}') from None
++        for line in log.read_text(errors='replace').splitlines():
++            if line.startswith('WARNING: '):
++                B.say('2/4 data: ' + line[len('WARNING: '):])
++    report = json.loads(index.read_text())
++    if 'data damage only inside' in report.get('integrity', ''):
++        B.say('2/4 data: ' + 'known damage tolerated: ' + report['integrity'])
++    fonts = tree / 'extracted/firmware/shared-fonts'
++    if not B.fonts_valid(fonts):
++        if shared_fonts:
++            fonts.mkdir(parents=True, exist_ok=True)
++            report = B.font_report(shared_fonts)
++            for f in report['fonts']:
++                name = f"{f['type']}-{f['name']}.bfttf"
++                shutil.copy2(shared_fonts / name, fonts / name)
++            (fonts / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
++        else:
++            if not firmware:
++                raise B.BuildError('NSP needs --firmware or --shared-fonts because no valid shared fonts are cached')
++            B.say('2/4 data: extracting the system shared fonts')
++            if fonts.exists():
++                shutil.rmtree(fonts)
++            B.run([py, 'scripts/extract_shared_fonts.py', '--keys', keys, '--firmware', firmware, '--output', fonts],
++                  logs / 'shared_fonts.log', cwd=tree)
++        B.validate_fonts(fonts)
++
++
++def step_shaders(tree, logs):
++    # BOTW has no prepared startup shader seed yet: shaders are translated and cached on first use.
++    if not (tree / 'build/spirv-cross/spirv-cross').exists():
++        B.say('3/4 shaders: building SPIRV-Cross with clang')
++        B.build_spirv_cross(tree, logs)
++    translator = tree / 'prebuilt/macos-arm64/totk_xlate'
++    if not translator.is_file() or B.sha256(translator) != (translator.parent / 'totk_xlate.sha256').read_text().strip():
++        raise B.BuildError(f'{translator}: not the shader translator this repository ships')
++    B.say('3/4 shaders: the shader translator is ready (BOTW shaders are translated on first use)')
++
++
++def step_binary(tree, game, keys, env, logs):
++    B.say('4/4 app: building the game binary and the launcher')
++    B.run(['make', f'runtime-{VERSION}'], logs / 'runtime-botw.log', cwd=tree, env=env)
++    B.run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', f'-DTOTK_GAME_{VERSION.upper()}=1',
++           'app/launcher.m', '-framework', 'AppKit', '-o', 'build/app-launcher-botw'], logs / 'launcher-botw.log', cwd=tree, env=env)
++    if not (tree / 'build/AppIcon-botw.icns').exists():
++        try:
++            B.run([tree / '.venv/bin/python', 'scripts/extract_app_icon.py', game, '--keys', keys, '--output', 'build/AppIcon-botw.icns'],
++                  logs / 'app_icon-botw.log', cwd=tree)
++        except B.BuildError as e:
++            B.say(f'   no app icon, the app gets the default one ({str(e).splitlines()[0]})')
++
++
++def step_app(tree, out, logs):
++    tmp = out.with_name(out.name + '.partial')
++    if tmp.exists():
++        shutil.rmtree(tmp)
++    res = tmp / 'Contents/Resources/totk'
++    B.clone(tree / f'build/totk-native-{VERSION}', res / 'build/botw-native')
++    for rel in ('build/pso_manifest.tsv', 'build/spirv-cross/spirv-cross',
++                f'rewritten/{VERSION}/main.patched.bin', f'rewritten/{VERSION}/sdk.patched.bin', f'rewritten/{VERSION}/subsdk0.patched.bin',
++                f'extracted/{VERSION}/romfs/romfs.bin', f'extracted/{VERSION}/romfs/runtime-index.bin'):
++        B.clone(tree / rel, res / rel)
++    B.clone(tree / 'prebuilt/macos-arm64/totk_xlate', res / 'build/shader-service/totk_xlate')
++    B.copy_tree(tree / 'extracted/firmware/shared-fonts', res / 'extracted/firmware/shared-fonts')
++    B.clone(tree / 'build/app-launcher-botw', tmp / f'Contents/MacOS/{EXECUTABLE}')
++    info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable=EXECUTABLE, CFBundleIdentifier=BUNDLE_ID, CFBundleName=APP_NAME,
++                CFBundleDisplayName=APP_NAME, CFBundlePackageType='APPL', CFBundleShortVersionString=EXPECTED['display_version'],
++                CFBundleVersion='1', LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
++                LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
++                GCSupportsControllerUserInteraction=True)
++    icon = tree / 'build/AppIcon-botw.icns'
++    if icon.exists():
++        B.clone(icon, tmp / 'Contents/Resources/AppIcon.icns')
++        info['CFBundleIconFile'] = 'AppIcon'
++    (tmp / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
++    (tmp / 'Contents/PkgInfo').write_bytes(b'APPL????')
++    B.sign_app(tmp, logs)
++    old_binary = out / 'Contents/Resources/totk/build/botw-native'
++    while old_binary.is_file():
++        processes = subprocess.run(['ps', '-axo', 'comm='], capture_output=True, text=True, check=True).stdout.splitlines()
++        if str(old_binary.resolve()) not in (p.strip() for p in processes):
++            break
++        B.say('4/4 app: replacement is ready; waiting for the running game to close before updating it')
++        time.sleep(5)
++    if out.exists():
++        shutil.rmtree(out)
++    tmp.rename(out)
++
++
++def main(args):
++    game, keys, update = (p.expanduser().resolve() for p in (args.game, args.keys, args.update))
++    for p in (game, keys, update):
++        if not p.is_file():
++            raise B.BuildError(f'no such file: {p}')
++    if B.input_kind(game) != 'nsp' or B.input_kind(update) != 'nsp':
++        raise B.BuildError('BOTW needs the base game NSP and the 1.9.0 update NSP')
++    out = args.out.expanduser().resolve() if args.out else game.parent / f'{APP_NAME}.app'
++    work = args.work.expanduser().resolve() if args.work else game.parent / 'BOTW_build'
++    if out.suffix != '.app':
++        raise B.BuildError(f'the output must end in .app: {out}')
++    firmware = args.firmware.expanduser().resolve() if args.firmware else None
++    shared_fonts = args.shared_fonts.expanduser().resolve() if args.shared_fonts else None
++    py = B.prerequisites(args)
++    free = shutil.disk_usage(work.parent if work.parent.exists() else game.parent).free / 2**30
++    B.say(f'work folder {work} ({free:.0f} GB free on its volume)')
++    if free < 35 and not (work / f'totk/extracted/{VERSION}/romfs/romfs.bin').exists():
++        raise B.BuildError('needs about 35 GB free for a fresh BOTW build')
++    logs = work / 'logs'
++    env = dict(os.environ, PATH=os.pathsep.join(B.TOOL_PATHS + [os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')]))
++    t0 = time.time()
++    tree = B.prepare_work(work, py, logs)
++    step_code(tree, update, keys, env, logs)
++    step_data(tree, game, update, keys, logs, firmware, shared_fonts)
++    step_shaders(tree, logs)
++    step_binary(tree, game, keys, env, logs)
++    B.say(f'4/4 app: assembling {out}')
++    step_app(tree, out, logs)
++    B.run([B.LSREGISTER, '-f', out], logs / 'register-app-botw.log')
++    B.say('4/4 app: macOS checks the new app once (a few minutes)')
++    r = subprocess.run([out / f'Contents/MacOS/{EXECUTABLE}', '--check'], capture_output=True, text=True, timeout=1800)
++    if r.returncode:
++        raise B.BuildError(f'the app does not start: {(r.stdout + r.stderr).strip()}')
++    B.say(f'done in {(time.time() - t0) / 60:.0f} min: {out}')
++    return 0
+diff --git a/games/botw/scripts/build_native.sh b/games/botw/scripts/build_native.sh
+new file mode 100755
+index 0000000..e5ba08c
+--- /dev/null
++++ b/games/botw/scripts/build_native.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++# Out-of-tree compile of the BOTW 1.9.0 loader; mirrors the Makefile's build/totk-native-v143 rule. Compile + link only, never runs the game.
++# Usage: build_native.sh <data-root> <output-dir> <fonts-config-dir>
++#   data-root: holds build/v190/runtime_tables.h and romfs_config.h (scripts/prepare_runtime.py and prepare_romfs_backend.py, --version v190 --data-root)
++#   output-dir: receives gfx objects and botw-native-v190 (keep it outside the repository)
++#   fonts-config-dir: directory containing shared_fonts_config.h (scripts/prepare_shared_fonts.py; firmware shared fonts are game independent)
++set -e
++G="$(cd "$(dirname "$0")/../../totk" && pwd)"
++DATA="$(cd "$1" && pwd)"; O="$2"; FONTS="$(cd "$3" && pwd)"
++[ -n "$O" ] || { echo 'usage: build_native.sh <data-root> <output-dir> <fonts-config-dir>'; exit 2; }
++mkdir -p "$O/gfx"; O="$(cd "$O" && pwd)"
++cd $G
++GFX_FLAGS="-std=gnu11 -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include"
++OBJS=()
++for src in third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.m third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c third_party/d2r_gfx/gfx/tex/*.m; do
++  [ -f "$src" ] || continue
++  obj=$O/gfx/$(echo "$src" | tr '/' '_').o
++  if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ]; then xcrun clang -O2 -g -Wall -Wextra $GFX_FLAGS -c "$src" -o "$obj"; fi
++  OBJS+=("$obj")
++done
++echo "gfx objects: ${#OBJS[@]}"
++xcrun clang -std=c11 -O2 -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V190=1 \
++ -I"$DATA/build/v190" -I"$FONTS" -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include \
++ runtime/loader.c runtime/game_patches_v190.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/romfs_mods.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c \
++ "${OBJS[@]}" /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a \
++ -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -framework CoreHaptics \
++ -o $O/botw-native-v190
++echo BUILD_OK
+diff --git a/games/botw/scripts/extract_exefs.py b/games/botw/scripts/extract_exefs.py
+new file mode 100644
+index 0000000..a36bb90
+--- /dev/null
++++ b/games/botw/scripts/extract_exefs.py
+@@ -0,0 +1,254 @@
++#!/usr/bin/env python3
++"""Read an XCI or NSP in place; extract and verify its base or explicitly selected update Program ExeFS.
++
++Supports NCA3, key-area or common-ticket AES-CTR, and hierarchical SHA-256 PFS0.
++Keys stay in memory. No RomFS extraction, executable launch, or network calls.
++"""
++import argparse
++import hashlib
++import json
++import struct
++import io
++from pathlib import Path
++from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
++
++
++BASE_TITLE = '01007EF00011E000'    # The Legend of Zelda: Breath of the Wild
++UPDATE_TITLE = '01007EF00011E800'  # its update; the update Program NCA keeps the base ID, its Meta NCA carries this one
++
++
++def require(condition, message):
++    if not condition:
++        raise ValueError(message)
++
++
++def decrypt(key, mode, data):
++    ctx = Cipher(algorithms.AES(key), mode).decryptor()
++    return ctx.update(data) + ctx.finalize()
++
++
++def read_at(f, offset, length):
++    require(0 <= offset and 0 <= length <= 512 * 1024 * 1024, 'Invalid/big read')
++    f.seek(offset)
++    data = f.read(length)
++    require(len(data) == length, 'Truncated input')
++    return data
++
++
++def hfs(f, offset, bound):
++    return partition_entries(f, offset, bound, b'HFS0', 64)
++
++
++def partition_entries(f, offset, bound, magic=b'PFS0', stride=24):
++    """Read a bounded PFS0/HFS0 table without loading its file payloads."""
++    require(bound >= 16, 'Truncated partition header')
++    hdr = read_at(f, offset, 16)
++    require(hdr[:4] == magic, f'Expected {magic.decode()}')
++    count, strings_size = struct.unpack_from('<II', hdr, 4)
++    require(count <= 4096 and strings_size <= 1024 * 1024, 'Invalid partition table')
++    size = 16 + count * stride + strings_size
++    require(size <= bound, 'Partition table out of bounds')
++    raw = read_at(f, offset, size)
++    strings = raw[16 + count * stride:]
++    entries = []
++    names = set()
++    for i in range(count):
++        off, length, nameoff = struct.unpack_from('<QQI', raw, 16 + i * stride)
++        require(nameoff < len(strings), 'Invalid partition filename offset')
++        end = strings.find(b'\0', nameoff)
++        require(end >= 0, 'Unterminated partition filename')
++        name = strings[nameoff:end].decode('utf-8')
++        require(name not in ('', '.', '..') and '/' not in name and '\\' not in name, 'Unsafe partition filename')
++        require(name not in names, 'Duplicate partition filename')
++        names.add(name)
++        require(size + off + length <= bound, 'Partition entry out of bounds')
++        entries.append((name, offset + size + off, length))
++    end = offset + size
++    for _, start, length in sorted(entries, key=lambda e: e[1]):
++        require(start >= end, 'Overlapping partition entries')
++        end = start + length
++    return entries
++
++
++def container_entries(f, size):
++    if read_at(f, 0, 4) == b'PFS0':
++        return 'nsp', partition_entries(f, 0, size)
++    require(size >= 0x138 and read_at(f, 0x100, 4) == b'HEAD', 'Expected an XCI or NSP (PFS0) game file')
++    root = struct.unpack('<Q', read_at(f, 0x130, 8))[0]
++    partitions = hfs(f, root, size - root)
++    secure = [e for e in partitions if e[0] == 'secure']
++    require(len(secure) == 1, 'Expected one XCI secure partition')
++    return 'xci', hfs(f, secure[0][1], secure[0][2])
++
++
++def load_keys(path):
++    keys = {}
++    for number, line in enumerate(path.read_text().splitlines(), 1):
++        line = line.split('#', 1)[0].strip()
++        if '=' in line:
++            name, value = line.split('=', 1)
++            try:
++                keys[name.strip().lower()] = bytes.fromhex(value.strip())
++            except ValueError:
++                raise ValueError(f'Invalid key encoding at line {number}') from None
++    return keys
++
++
++def common_tickets(f, entries):
++    """Keep encrypted title keys in memory only, as nxnative's NSP importer does.
++
++    Ticket offsets below are relative to the signed body; accept the standard RSA/ECDSA layouts.
++    A personalized ticket cannot provide a common title key and is never treated as one.
++    """
++    tickets = {}
++    bodies = {0x10000: 0x240, 0x10001: 0x140, 0x10002: 0x80,
++              0x10003: 0x240, 0x10004: 0x140, 0x10005: 0x80}
++    for name, offset, size in entries:
++        if not name.lower().endswith('.tik'):
++            continue
++        require(size >= 4, 'Truncated NSP ticket')
++        # Switch ticket signature type is little-endian: RSA2048/SHA256 = 04 00 01 00.
++        sig = struct.unpack('<I', read_at(f, offset, 4))[0]
++        require(sig in bodies, 'Unsupported NSP ticket signature type')
++        body = bodies[sig]
++        require(size >= body + 0x180, 'Truncated NSP ticket body')
++        data = read_at(f, offset + body, 0x180)
++        require(data[0x141] == 0, 'Personalized NSP tickets are unsupported; a common ticket is required')
++        rights, key = data[0x160:0x170], data[0x40:0x50]
++        require(rights not in tickets or tickets[rights] == key, 'Conflicting NSP tickets')
++        tickets[rights] = key
++    return tickets
++
++
++def read_nca_header(f, offset, size, keys):
++    require(size >= 0xc00, 'Truncated NCA header')
++    require('header_key' in keys, 'Missing header_key in prod.keys')
++    raw = read_at(f, offset, 0xc00)
++    hdr = b''.join(decrypt(keys['header_key'], modes.XTS(i.to_bytes(16, 'big')),
++                           raw[i * 512:(i + 1) * 512]) for i in range(6))
++    require(hdr[0x200:0x204] == b'NCA3', 'Expected NCA3 (check prod.keys and the game file)')
++    require(struct.unpack_from('<Q', hdr, 0x208)[0] == size, 'NCA size does not match container entry')
++    for i in range(4):
++        start, end = struct.unpack_from('<II', hdr, 0x240 + i * 16)
++        require((start == end == 0) or 0xc00 <= start * 512 < end * 512 <= size, 'NCA section out of bounds')
++    return hdr
++
++
++def nca_ctr_key(hdr, keys, tickets):
++    generation = max(max(hdr[0x206], hdr[0x220]) - 1, 0)
++    rights = hdr[0x230:0x240]
++    if rights != bytes(16):
++        require(rights in tickets, 'Missing common ticket for rights-managed NCA in the NSP')
++        keyname = f'titlekek_{generation:02x}'
++        require(keyname in keys, f'Missing {keyname} in prod.keys')
++        return decrypt(keys[keyname], modes.ECB(), tickets[rights])
++    require(hdr[0x207] < 3, 'Unsupported NCA key area')
++    area = ('application', 'ocean', 'system')[hdr[0x207]]
++    keyname = f'key_area_key_{area}_{generation:02x}'
++    require(keyname in keys, f'Missing {keyname} in prod.keys')
++    return decrypt(keys[keyname], modes.ECB(), hdr[0x300:0x340])[32:48]
++
++
++def nca_inventory(f, entries, keys):
++    records = []
++    for name, offset, length in entries:
++        if not name.lower().endswith('.nca'):
++            continue
++        hdr = read_nca_header(f, offset, length, keys)
++        record = dict(name=name, nca_offset=offset, size=length, content_type=hdr[0x205],
++                      title_id=f'{struct.unpack_from("<Q", hdr, 0x210)[0]:016X}')
++        records.append((record, hdr))
++    return records
++
++
++def program_nca(records, update=False):
++    if update:
++        programs = [(r, h) for r, h in records if r["content_type"] == 0]
++        require(len(programs) == 1, "Expected one update Program NCA; combined packages are unsupported")
++        record, hdr = programs[0]
++        require(record["title_id"] == BASE_TITLE, "Update belongs to another game")
++        require(any(hdr[0x400 + i*512 + 4] == 4 for i in range(4)), "Expected a BKTR update, not a base game")
++        require(all(r["title_id"] in (BASE_TITLE, UPDATE_TITLE) for r, _ in records), "Mixed-title update package")
++        return record, hdr
++    # Update Program NCAs can retain the base title ID; their Meta NCA carries the update ID.
++    metadata = [r for r, _ in records if r['content_type'] == 1]
++    require(len(metadata) <= 1 and all(r['title_id'] == BASE_TITLE for r in metadata),
++            'Expected base game metadata; updates, DLC and combined packages are unsupported')
++    programs = [(r, h) for r, h in records if r['content_type'] == 0]
++    require(len(programs) == 1, 'Expected one base Program NCA; updates, DLC and combined packages are unsupported')
++    record, hdr = programs[0]
++    require(record['title_id'] == BASE_TITLE,
++            'Expected Breath of the Wild base game; updates, DLC and other games are unsupported')
++    return record, hdr
++
++
++def record_offset(record):
++    # Read manifests produced before NSP support too.
++    return record['nca_offset'] if 'nca_offset' in record else record['xci_offset']
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('game', type=Path, help='base game (.xci or .nsp), or with --update the 1.9.0 update NSP')
++    parser.add_argument('--keys', required=True, type=Path)
++    parser.add_argument('--update', action='store_true', help='extract update code; caller must verify supported version hashes')
++    parser.add_argument('--output', required=True, type=Path)
++    args = parser.parse_args()
++    require(not args.output.exists(), 'Output already exists; choose a new directory')
++    keys = load_keys(args.keys)
++    with args.game.open('rb') as f:
++        kind, entries = container_entries(f, args.game.stat().st_size)
++        tickets = common_tickets(f, entries)
++        records = nca_inventory(f, entries, keys)
++        record, hdr = program_nca(records, update=args.update)
++        ctr_key = nca_ctr_key(hdr, keys, tickets)
++        for i in range(4):
++            start, end = struct.unpack_from('<II', hdr, 0x240 + 16 * i)
++            if not start:
++                continue
++            fs = hdr[0x400 + 512 * i:0x600 + 512 * i]
++            require(hashlib.sha256(fs).digest() == hdr[0x280 + 32 * i:0x2A0 + 32 * i], 'FS header hash mismatch')
++            if fs[2:4] != b'\x01\x02':
++                continue
++            require(fs[4] == 3, 'Only AES-CTR ExeFS is supported')
++            blocksize, levels = struct.unpack_from('<II', fs, 0x28)
++            hashoff, hashsize, pfsoff, pfssize = struct.unpack_from('<QQQQ', fs, 0x30)
++            secstart, secsize = start * 512, (end - start) * 512
++            require(levels == 2 and blocksize > 0 and pfssize <= 512 * 1024 * 1024, 'Unsupported ExeFS hash layout')
++
++            def section_read(relative, size):
++                require(relative >= 0 and relative + size <= secsize, 'Section read out of bounds')
++                absolute = secstart + relative
++                aligned = absolute & ~15
++                iv = fs[0x140:0x148][::-1] + (aligned // 16).to_bytes(8, 'big')
++                data = read_at(f, record_offset(record) + aligned, size + absolute - aligned)
++                return decrypt(ctr_key, modes.CTR(iv), data)[absolute - aligned:]
++
++            hashes = section_read(hashoff, hashsize)
++            require(hashlib.sha256(hashes).digest() == fs[8:40], 'ExeFS hash-table mismatch')
++            pfs = section_read(pfsoff, pfssize)
++            for index, pos in enumerate(range(0, pfssize, blocksize)):
++                expected = hashes[index * 32:(index + 1) * 32]
++                require(hashlib.sha256(pfs[pos:pos + blocksize]).digest() == expected,
++                        f'ExeFS block hash mismatch: {index}')
++            files = [(name, pfs[off:off + size]) for name, off, size in
++                     partition_entries(io.BytesIO(pfs), 0, len(pfs))]
++            require(any(name == 'main.npdm' for name, _ in files), 'PFS0 is not ExeFS')
++            args.output.mkdir(parents=True)
++            extracted = []
++            for name, data in files:
++                (args.output / name).write_bytes(data)
++                extracted.append({'name': name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
++            manifest = {'source': str(args.game.resolve()), 'source_size': args.game.stat().st_size,
++                        'source_mtime_ns': args.game.stat().st_mtime_ns, 'container': kind,
++                        'nca_inventory': [r for r, _ in records], 'program': record, 'section_index': i,
++                        'integrity': 'FS header, ExeFS hash table, and every ExeFS data block verified; RSA signatures not checked',
++                        'files': extracted}
++            (args.output.parent / 'extraction-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
++            print(json.dumps({'integrity': manifest['integrity'], 'files': extracted}, indent=2))
++            return
++        raise ValueError('No ExeFS section found')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/games/botw/scripts/extract_romfs.py b/games/botw/scripts/extract_romfs.py
+new file mode 100644
+index 0000000..0b057be
+--- /dev/null
++++ b/games/botw/scripts/extract_romfs.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++"""Verify all six IVFC levels, stream a local RomFS image, and index its files."""
++import argparse
++import hashlib
++import json
++import struct
++from pathlib import Path
++from cryptography.hazmat.primitives.ciphers import modes
++from extract_exefs import (decrypt, read_at, require, load_keys, container_entries, common_tickets,
++                           nca_inventory, program_nca, nca_ctr_key, record_offset)
++
++def main():
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--keys',type=Path,required=True)
++    parser.add_argument('--manifest',type=Path,default=Path('extracted/v0/extraction-manifest.json'))
++    parser.add_argument('--output',type=Path,default=Path('extracted/v0/romfs'))
++    args=parser.parse_args(); require(not args.output.exists(),'Output already exists')
++    manifest=json.loads(args.manifest.read_text());record=manifest['program'];keys=load_keys(args.keys)
++    source=Path(manifest['source']);require(source.stat().st_size==manifest['source_size'],'Source size changed')
++    with source.open('rb') as f:
++        _,entries=container_entries(f,source.stat().st_size)
++        actual,hdr=program_nca(nca_inventory(f,entries,keys))
++        require(actual['name']==record['name'] and actual['size']==record['size'] and
++                record_offset(actual)==record_offset(record),'Source Program NCA changed; extract ExeFS again')
++        ctr_key=nca_ctr_key(hdr,keys,common_tickets(f,entries))
++        for i in range(4):
++            start,end=struct.unpack_from('<II',hdr,0x240+i*16)
++            if not start:continue
++            fs=hdr[0x400+512*i:0x600+512*i]
++            require(hashlib.sha256(fs).digest()==hdr[0x280+32*i:0x2a0+32*i],'FS header hash')
++            if fs[2:5]!=bytes([0,3,3]):continue
++            require(fs[8:12]==b'IVFC' and struct.unpack_from('<III',fs,12)==(0x20000,32,7),'Unsupported IVFC layout')
++            levels=[struct.unpack_from('<QQII',fs,0x18+j*24) for j in range(6)]
++            def read(relative,size):
++                require(0<=relative<=relative+size<=(end-start)*512,'Section bounds')
++                absolute=start*512+relative;aligned=absolute&~15;skip=absolute-aligned
++                iv=fs[0x140:0x148][::-1]+(aligned//16).to_bytes(8,'big')
++                return decrypt(ctr_key,modes.CTR(iv),read_at(f,record_offset(record)+aligned,size+skip))[skip:]
++            args.output.mkdir(parents=True);image_path=args.output/'romfs.bin';digest=hashlib.sha256();counts=[]
++            parent=fs[0xc8:0xe8]
++            with image_path.open('wb') as image:
++                for level,(offset,size,power,reserved) in enumerate(levels):
++                    require(12<=power<=24 and reserved==0,'IVFC block size');block=1<<power
++                    require(len(parent)>=(size+block-1)//block*32,'IVFC parent size')
++                    captured=bytearray() if level<5 else None
++                    index=0
++                    for pos in range(0,size,8*1024*1024):
++                        chunk=read(offset+pos,min(8*1024*1024,size-pos))
++                        for j in range(0,len(chunk),block):
++                            payload=chunk[j:j+block]
++                            require(hashlib.sha256(payload+bytes(block-len(payload))).digest()==parent[index*32:index*32+32],f'IVFC level {level} block {index} failed')
++                            index+=1
++                        if captured is not None:captured.extend(chunk)
++                        else:image.write(chunk);digest.update(chunk)
++                    counts.append(index)
++                    if captured is not None:parent=bytes(captured)
++                    print(f'IVFC level {level}: {index} blocks verified',flush=True)
++            files=index_romfs(image_path)
++            report=dict(status='pass',source_size=source.stat().st_size,program=record['name'],section=i,ivfc_blocks=counts,romfs_size=levels[-1][1],romfs_sha256=digest.hexdigest(),files=files,integrity='FS header and all six IVFC levels verified; RSA signature not checked')
++            (args.output/'index.json').write_text(json.dumps(report,indent=2)+'\n')
++            print(json.dumps(dict(status='pass',file_count=len(files),size=levels[-1][1],sha256=digest.hexdigest())),flush=True);return
++    raise ValueError('No supported RomFS found')
++
++def index_romfs(path):
++    with path.open('rb') as f:
++        h=struct.unpack('<10Q',read_at(f,0,80));require(h[0]==80,'RomFS header');length=path.stat().st_size
++        for off,size in [(h[1],h[2]),(h[3],h[4]),(h[5],h[6]),(h[7],h[8])]:require(off+size<=length,'RomFS table bounds')
++        dirs=read_at(f,h[3],h[4]);entries=read_at(f,h[7],h[8]);files=[];seen_dirs=set();seen_files=set();paths=set()
++        def name(table,off,n):
++            require(off+n<=len(table),'Name bounds');s=table[off:off+n].decode('utf-8');require(s not in ['.','..'] and '/' not in s and '\\' not in s and '\0' not in s,'Unsafe path');return s
++        todo=[(0,'')]
++        while todo:
++            off,parent=todo.pop();require(off not in seen_dirs and off+24<=len(dirs),'Invalid/cyclic directory');seen_dirs.add(off)
++            p,sibling,child,file,hash_next,n=struct.unpack_from('<6I',dirs,off);part=name(dirs,off+24,n);prefix=parent+part+'/' if part else parent
++            if sibling!=0xffffffff:todo.append((sibling,parent))
++            if child!=0xffffffff:todo.append((child,prefix))
++            while file!=0xffffffff:
++                require(file not in seen_files and file+32<=len(entries),'Invalid/cyclic file');seen_files.add(file)
++                p,next_file,data,size,hash_next,n=struct.unpack_from('<IIQQII',entries,file);part=name(entries,file+32,n);require(part!='','Empty file name');filename=prefix+part
++                require(filename not in paths and h[9]+data+size<=length,'Duplicate/out-of-bounds file');paths.add(filename)
++                files.append(dict(path=filename,offset=h[9]+data,size=size));file=next_file
++        return sorted(files,key=lambda item:item['path'])
++if __name__=='__main__':main()
+diff --git a/games/botw/scripts/extract_update_romfs.py b/games/botw/scripts/extract_update_romfs.py
+new file mode 100644
+index 0000000..ddd9a6c
+--- /dev/null
++++ b/games/botw/scripts/extract_update_romfs.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python3
++"""Merge a base XCI/NSP and an update NSP with the pinned hactool BKTR reader.
++
++Temporary common-ticket keys are private files, never arguments or log output.
++The caller additionally verifies the resulting image against its known version hash.
++"""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import shutil
++import subprocess
++import tempfile
++from extract_exefs import (load_keys, container_entries, common_tickets, nca_inventory,
++                           program_nca, record_offset, require)
++from extract_romfs import index_romfs
++from romfs_damage import ALLOWED, KNOWN_DAMAGE_MESSAGE, judge
++
++
++def copy_range(source, offset, size, target):
++    with source.open('rb') as src, target.open('wb') as dst:
++        src.seek(offset)
++        while size:
++            data = src.read(min(size, 8 << 20))
++            require(bool(data), 'Truncated NCA')
++            dst.write(data)
++            size -= len(data)
++
++
++def merge(base, update, keys_path, hactool, output, *, base_romfs=None):
++    require(not output.exists(), 'Output exists')
++    keys = load_keys(keys_path)
++    inputs = []
++    tickets = {}
++    sources = ((update, True),) if base_romfs else ((base, False), (update, True))
++    for source, is_update in sources:
++        with source.open('rb') as f:
++            kind, entries = container_entries(f, source.stat().st_size)
++            require(not is_update or kind == 'nsp', 'Update must be an NSP')
++            found = common_tickets(f, entries)
++            for rights, key in found.items():
++                require(rights not in tickets or tickets[rights] == key, 'Conflicting common tickets')
++                tickets[rights] = key
++            record, header = program_nca(nca_inventory(f, entries, keys), update=is_update)
++            rights = header[0x230:0x240]
++            require(rights == bytes(16) or rights in tickets, 'Missing common ticket')
++            inputs.append((source, record, header))
++    sections = [i for i in range(4) if inputs[-1][2][0x400+i*512+4] == 4]
++    require(len(sections) == 1, 'Expected one BKTR section')
++    output.parent.mkdir(parents=True, exist_ok=True)
++    require(shutil.disk_usage(output.parent).free > inputs[-1][1]['size'] + 18*(1 << 30),
++            'Need about 19 GiB free for the temporary update NCA and merged image')
++    if base_romfs:
++        require(Path(base_romfs).is_file(), 'Previous-version RomFS is missing')
++    with tempfile.TemporaryDirectory(prefix='update-merge-', dir=output.parent) as tmp:
++        tmp = Path(tmp)
++        keyfile = tmp/'title.keys'
++        fd = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++        with os.fdopen(fd, 'w') as f:
++            for rights, key in tickets.items():
++                f.write(f'{rights.hex()} = {key.hex()}\n')
++        source, record, _ = inputs[-1]
++        copy_range(source, record_offset(record), record['size'], tmp/'update.nca')
++        result = tmp/'result'
++        result.mkdir()
++        base_arg = '--baseromfs='+str(Path(base_romfs).resolve()) if base_romfs else '--basenca='+str(base.resolve())
++        environment = dict(os.environ, MNG_TITLE_KEYS=str(keyfile))
++        environment.pop('MNG_BASE_RANGE_OFFSET', None); environment.pop('MNG_BASE_RANGE_SIZE', None)
++        if not base_romfs:
++            environment.update(MNG_BASE_RANGE_OFFSET=str(record_offset(inputs[0][1])),
++                               MNG_BASE_RANGE_SIZE=str(inputs[0][1]['size']))
++        command = [str(hactool.resolve()), '-x', '-y', '--disablekeywarns', '--suppresskeys',
++                   '-k', str(keys_path.resolve()), base_arg,
++                   f'--section{sections[0]}='+str(result/'romfs.bin'), str(tmp/'update.nca')]
++        with (result/'merge.log').open('w') as log:
++            code = subprocess.run(command, env=environment,
++                                  stdout=log, stderr=subprocess.STDOUT).returncode
++        log = (result/'merge.log').read_text()
++        if code or re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', log):
++            (output.parent/(output.name+'-failure.log')).write_text(log)
++        require(code == 0 and not re.search(r'Failed to|Error:', log), 'BKTR merge failed')
++        # Only the RomFS data level may fail, and only inside the one tolerated file (romfs_damage.py).
++        require(all(re.search(rf'Level {i} \(GOOD\)', log) for i in range(5)), 'IVFC hash tree did not verify')
++        require(not re.search(r'\(INVALID\)', log) and len(re.findall(r'\(FAIL\)', log)) <= 1, 'BKTR verification failed')
++        image = result/'romfs.bin'
++        files = index_romfs(image)
++        integrity = 'BKTR merge; all six IVFC levels verified'
++        if not re.search(r'Level 5 \(GOOD\)', log):
++            require('Level 5 (FAIL)' in log and 'MNG_BADBLOCK' in log, 'Missing verified IVFC levels')
++            verdict = judge(log, [(f['path'], f['offset'], f['size']) for f in files])
++            require(verdict.ok, 'RomFS damage outside the tolerated file, replace the update package: ' + ', '.join(verdict.offending[:20]))
++            integrity = 'BKTR merge; hash tree verified; data damage only inside ' + ALLOWED
++            print('WARNING: ' + KNOWN_DAMAGE_MESSAGE, flush=True)
++        with image.open('rb') as f:
++            digest = hashlib.file_digest(f, 'sha256').hexdigest()
++        report = dict(status='pass', romfs_size=image.stat().st_size, romfs_sha256=digest,
++                      files=files, integrity=integrity)
++        (result/'index.json').write_text(json.dumps(report, indent=2)+'\n')
++        result.rename(output)
++    print(json.dumps(dict(status='pass', files=len(files), sha256=digest)))
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('base', type=Path)
++    parser.add_argument('update', type=Path)
++    parser.add_argument('--keys', required=True, type=Path)
++    parser.add_argument('--hactool', required=True, type=Path)
++    parser.add_argument('--base-romfs', type=Path, help='full decrypted base IVFC section, including hash levels (not a raw RomFS image)')
++    parser.add_argument('--output', required=True, type=Path)
++    args = parser.parse_args()
++    merge(args.base, args.update, args.keys, args.hactool, args.output, base_romfs=args.base_romfs)
+diff --git a/games/botw/scripts/romfs_damage.py b/games/botw/scripts/romfs_damage.py
+new file mode 100644
+index 0000000..cdbe608
+--- /dev/null
++++ b/games/botw/scripts/romfs_damage.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""The one RomFS damage the BOTW build tolerates.
++
++Some copies of the 1.9.0 update carry one damaged 1 MiB region; every bad IVFC data block lies inside
++Event_BGM_CompleteMasterSword.bfstm (a music stream). A merge whose only bad blocks come from the update and lie inside
++that file is accepted with a warning. Any other bad block (another file, RomFS metadata, the IVFC hash tree or the base
++game) stops the build.
++"""
++from dataclasses import dataclass, field
++import re
++
++ALLOWED = 'Sound/Resource/Stream/Event_BGM_CompleteMasterSword.bfstm'
++KNOWN_DAMAGE_MESSAGE = '更新文件有一处已知损坏，只影响拔出大师之剑时的一段背景音乐'
++METADATA = '<RomFS metadata>'
++
++
++@dataclass
++class DamageVerdict:
++    ok: bool
++    known: bool
++    offending: list = field(default_factory=list)
++
++
++@dataclass
++class BadBlocks:
++    data: list            # (start, end) RomFS offsets of bad data blocks read from the update
++    base_data: list       # the same, read from the base game
++    hash_tree: bool       # a block of an upper IVFC level (the hash tree) failed
++
++
++def check_damage(bad_ranges, files):
++    """bad_ranges: (start, end) RomFS offsets; files: (path, offset, size). Only damage inside ALLOWED is tolerated."""
++    offending, known = [], False
++    for start, end in bad_ranges:
++        hit = [path for path, offset, size in files if start < offset + size and offset < end]
++        if not hit:
++            hit = [METADATA]
++        for path in hit:
++            if path == ALLOWED:
++                known = True
++            elif path not in offending:
++                offending.append(path)
++    return DamageVerdict(ok=not offending, known=known and not offending, offending=offending)
++
++
++_LINE = re.compile(r'MNG_BADBLOCK data_ofs=([0-9a-f]+) ofs=([0-9a-f]+) len=([0-9a-f]+) src=(\w+)')
++_LEVEL5 = re.compile(r'Level 5 \((?:GOOD|FAIL)\):\s*\n\s*Data Offset:\s*0x([0-9a-fA-F]+)')
++
++
++def parse_bad_blocks(log):
++    """The MNG_BADBLOCK lines of the pinned hactool (build_app.build_hactool). Level 5 is the RomFS data itself."""
++    level5 = _LEVEL5.search(log)
++    data_start = int(level5.group(1), 16) if level5 else None
++    blocks = BadBlocks(data=[], base_data=[], hash_tree=False)
++    for m in _LINE.finditer(log):
++        data_ofs, ofs, size = (int(m.group(i), 16) for i in (1, 2, 3))
++        if data_start is None or data_ofs != data_start:
++            blocks.hash_tree = True
++        elif m.group(4) == 'PATCH':
++            blocks.data.append((ofs, ofs + size))
++        else:
++            blocks.base_data.append((ofs, ofs + size))
++    return blocks
++
++
++def judge(log, files):
++    """The verdict for a merge log; files as in check_damage. Base-game damage and hash-tree damage are never tolerated."""
++    blocks = parse_bad_blocks(log)
++    verdict = check_damage(blocks.data, files)
++    if blocks.base_data:
++        base = check_damage(blocks.base_data, files)
++        verdict.offending += [f'{p} (base game)' for p in base.offending + ([ALLOWED] if base.known else [])]
++    if blocks.hash_tree:
++        verdict.offending.append('<IVFC hash tree>')
++    verdict.ok = not verdict.offending
++    verdict.known = verdict.known and verdict.ok
++    return verdict
+diff --git a/games/botw/versions.json b/games/botw/versions.json
+new file mode 100644
+index 0000000..4479be7
+--- /dev/null
++++ b/games/botw/versions.json
+@@ -0,0 +1,31 @@
++{
++  "title": "The Legend of Zelda: Breath of the Wild",
++  "base_title_id": "01007EF00011E000",
++  "update_title_id": "01007EF00011E800",
++  "architecture": "AArch64 (NPDM 64-bit flag verified)",
++  "versions": {
++    "v190": {
++      "display_version": "1.9.0",
++      "container": "update NSP (cumulative), base game NSP not needed for ExeFS",
++      "nso_build_id": {
++        "main": "cd57b23fa4bbad65803d9788c01821ee",
++        "sdk": "574284b40c06cf1821a44857939083bee5716820",
++        "subsdk0": "f39f4c431234c72eb520cfdd1001bbcf02b3e885"
++      },
++      "sdk_version": "nnSdk-20_5_22",
++      "exefs_sha256": {
++        "main": "f6f0b20bb1f2b67d164c24871cd473147eef1d285f12e7bd492e3126c6022e27",
++        "main.npdm": "38a7484e19b7a51dffda5e58c5c95a54f72c4d04bdf4bb76cbae81611fa29565",
++        "rtld": "49308064fddb52dfe9140c11a32cc6333a0917546c871967d013dcb076402817",
++        "sdk": "1d187f29784cd0af46e9e123fc2a62c77b3b07c5a39c8633d90d6c80de64e4ad",
++        "subsdk0": "767c35bcd7d23e78f9063c69b638290b8b83f91e839beb10799e6576960179b1"
++      },
++      "notes": "sdk and subsdk0 are byte-identical to TOTK 1.4.3; NPDM lists the same 49 services. Only main is BOTW-specific.",
++      "rewritten_sha256": {
++        "main.patched.bin": "6d48bff1b7f2692bd4f2efd3316b564877c50a10c6145610cf9a779b220538c6",
++        "sdk.patched.bin": "4d625d9baaebe60d38a00de1b8023fde7fb856d460a08433809670179483ca24",
++        "subsdk0.patched.bin": "0322958960fb205a8e108476f9e6b344e90cd5526f3e2c83503b3261ff2518e2"
++      }
++    }
++  }
++}
+diff --git a/games/totk/Makefile b/games/totk/Makefile
+index b2cdb42..1dd1ed8 100644
+--- a/games/totk/Makefile
++++ b/games/totk/Makefile
+@@ -68,8 +68,8 @@ verify:
+ build/runtime_tables.h: scripts/prepare_runtime.py analysis/phase12-validation.json
+ 	"$(PY)" scripts/prepare_runtime.py
+ 
+-build/totk-native: Makefile runtime/loader.c runtime/runtime.h runtime/game_patches.c runtime/game_patches.h runtime/game_version.h runtime/world_survey.c runtime/world_survey.h runtime/game_slot.c runtime/services.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/romfs.c runtime/romfs_path.h runtime/threads.c runtime/thread_compat.h runtime/thread_enter.S runtime/ipc.h runtime/audio_renderer.h runtime/audio_mixer.h runtime/audio_reverb.h runtime/fs_host.h runtime/autoload.h runtime/autoload.c build/runtime_tables.h build/romfs_config.h build/shared_fonts_config.h runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/movie_host.h runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS)
+-	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
++build/totk-native: Makefile runtime/loader.c runtime/runtime.h runtime/game_patches.c runtime/game_patches.h runtime/game_version.h runtime/world_survey.c runtime/world_survey.h runtime/game_slot.c runtime/services.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/romfs.c runtime/romfs_mods.c runtime/romfs_mods.h runtime/romfs_path.h runtime/threads.c runtime/thread_compat.h runtime/thread_enter.S runtime/ipc.h runtime/audio_renderer.h runtime/audio_mixer.h runtime/audio_reverb.h runtime/fs_host.h runtime/autoload.h runtime/autoload.c build/runtime_tables.h build/romfs_config.h build/shared_fonts_config.h runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/movie_host.h runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS)
++	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/romfs_mods.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+ 
+ build/pso_manifest.tsv: assets/pso_manifest.tsv
+ 	@mkdir -p build
+@@ -335,7 +335,7 @@ build/v112/runtime_tables.h: scripts/prepare_runtime.py analysis/v112-port/phase
+ build/v112/romfs_config.h: scripts/prepare_romfs_backend.py extracted/v112/romfs/index.json
+ 	"$(PY)" scripts/prepare_romfs_backend.py --version v112
+ build/totk-native-v112: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build/v112/runtime_tables.h build/v112/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS) Makefile
+-	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V112=1 -Ibuild/v112 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
++	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V112=1 -Ibuild/v112 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/romfs_mods.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+ runtime-v112: build/totk-native-v112 build/pso_manifest.tsv
+ 
+ # Isolated 1.4.3 build; never replace the validated v0 executable or generated headers.
+@@ -345,5 +345,15 @@ build/v143/runtime_tables.h: scripts/prepare_runtime.py analysis/v143-port/phase
+ build/v143/romfs_config.h: scripts/prepare_romfs_backend.py extracted/v143/romfs/index.json
+ 	"$(PY)" scripts/prepare_romfs_backend.py --version v143
+ build/totk-native-v143: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build/v143/runtime_tables.h build/v143/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS) Makefile
+-	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V143=1 -Ibuild/v143 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches_v143.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
++	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V143=1 -Ibuild/v143 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches_v143.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/romfs_mods.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+ runtime-v143: build/totk-native-v143 build/pso_manifest.tsv
++
++# BOTW 1.9.0 (games/botw); same runtime, its own tables and game patches.
++.PHONY: runtime-v190
++build/v190/runtime_tables.h: scripts/prepare_runtime.py analysis/v190-port/phase12-validation.json
++	"$(PY)" scripts/prepare_runtime.py --version v190
++build/v190/romfs_config.h: scripts/prepare_romfs_backend.py extracted/v190/romfs/index.json
++	"$(PY)" scripts/prepare_romfs_backend.py --version v190
++build/totk-native-v190: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build/v190/runtime_tables.h build/v190/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS) Makefile
++	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V190=1 -Ibuild/v190 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches_v190.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/romfs_mods.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
++runtime-v190: build/totk-native-v190 build/pso_manifest.tsv
+diff --git a/games/totk/app/launcher.m b/games/totk/app/launcher.m
+index 0fe8d52..797e9f2 100644
+--- a/games/totk/app/launcher.m
++++ b/games/totk/app/launcher.m
+@@ -67,14 +67,14 @@ static BOOL make_dir(NSString *path) {
+ int main(int argc, char **argv) {
+     @autoreleasepool {
+         NSString *root = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"totk"];
+-        NSString *binary = [root stringByAppendingPathComponent:@"build/totk-native"];
++        NSString *binary = [root stringByAppendingPathComponent:@"build/" TOTK_GAME_BINARY];
+         /* --check (build_app.py, once after packaging): only look that the game is there and exit. The first run of a new
+            app is when macOS scans the whole bundle (minutes for 16 GB, with nothing on screen); doing it during the build
+            makes the player's first start immediate. */
+         if (argc > 1 && !strcmp(argv[1], "--check")) {
+             int ok = access(binary.fileSystemRepresentation, X_OK) == 0;
+             NSString *declared = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+-            ok = ok && [declared isEqualToString:@TOTK_GAME_VERSION];
++            ok = ok && [declared isEqualToString:@TOTK_APP_VERSION];
+             printf("%s: game version %s\n", ok ? "ok" : "missing binary or version mismatch", TOTK_GAME_VERSION);
+             return ok ? 0 : 1;
+         }
+@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
+             return 1;
+         }
+         NSString *home = NSHomeDirectory();
+-        NSString *data = [home stringByAppendingPathComponent:@"Library/Application Support/MacNativeGames/TOTK"];
++        NSString *data = [home stringByAppendingPathComponent:@"Library/Application Support/MacNativeGames/" TOTK_GAME_DATA_NAME];
+         NSString *logs = [home stringByAppendingPathComponent:@"Library/Logs/MacNativeGames"];
+         /* Folders the environment already names are kept (open --env TOTK_PROFILE_DIR=... runs a test on a save copy,
+            TOTK_GAME_SLOT_DIR shares one game slot with another build of the game: one game at a time on the Mac). */
+@@ -131,15 +131,19 @@ int main(int argc, char **argv) {
+         setenv("TOTK_GPU_BUDGET_MB", "5000", 1);
+         setenv("TOTK_SLOT_OWNER", "user", 0);
+         setenv("TOTK_SLOT_PURPOSE", "player", 0);
++        /* RomFS mods: sw-launcher writes <data>/mods.tsv before each start (runtime/romfs_mods.c); no file, no mods. */
++        { NSString *mods = [data stringByAppendingPathComponent:@"mods.tsv"];
++          if (access(mods.fileSystemRepresentation, R_OK) == 0) setenv("TOTK_MODS_MANIFEST", mods.fileSystemRepresentation, 1);
++          else unsetenv("TOTK_MODS_MANIFEST"); }
+         unsetenv("TOTK_AUTOLOAD");   // the game starts at its title screen, as on the console
+         /* runtime command channel (runtime/input.c): echo "shot ~/Desktop/shot.png" >> "<data>/input.txt" */
+         { NSString *cmds = env_or("TOTK_INPUT_FILE", [data stringByAppendingPathComponent:@"input.txt"]);
+           FILE *cf = fopen(cmds.fileSystemRepresentation, "w"); if (cf) fclose(cf);
+           setenv("TOTK_INPUT_FILE", cmds.fileSystemRepresentation, 1); }
+ 
+-        NSString *log = [logs stringByAppendingPathComponent:@"totk.log"];
+-        [NSFileManager.defaultManager removeItemAtPath:[logs stringByAppendingPathComponent:@"totk.previous.log"] error:nil];
+-        [NSFileManager.defaultManager moveItemAtPath:log toPath:[logs stringByAppendingPathComponent:@"totk.previous.log"] error:nil];
++        NSString *log = [logs stringByAppendingPathComponent:@TOTK_GAME_LOG_NAME ".log"];
++        [NSFileManager.defaultManager removeItemAtPath:[logs stringByAppendingPathComponent:@TOTK_GAME_LOG_NAME ".previous.log"] error:nil];
++        [NSFileManager.defaultManager moveItemAtPath:log toPath:[logs stringByAppendingPathComponent:@TOTK_GAME_LOG_NAME ".previous.log"] error:nil];
+         FILE *lf = fopen(log.fileSystemRepresentation, "w");
+         if (lf) {
+             dup2(fileno(lf), STDOUT_FILENO);
+diff --git a/games/totk/runtime/account.c b/games/totk/runtime/account.c
+index ba520f4..ff80a48 100644
+--- a/games/totk/runtime/account.c
++++ b/games/totk/runtime/account.c
+@@ -40,11 +40,17 @@ static uint32_t user_id(Uid *out,const UserHandle *handle){lock_acquire();bool o
+ static void close_user(const UserHandle *handle){lock_acquire();if(!valid(handle))runtime_fail("invalid local account handle close");for(unsigned i=0;i<64;i++)if(tokens[i]==handle->token){tokens[i]=0;break;}lock_release();}
+ static uint32_t existence(unsigned char *out,const Uid *uid){if(!out||!uid)return 0x7c67;initialize();*out=same(uid);return 0;}
+ static uint32_t nickname(char *out,const Uid *uid){initialize();if(!out||!same(uid))return 0x7c67;memset(out,0,33);memcpy(out,"Local",5);return 0;}
++/* nn::account::ListAllUsers(int *count, Uid *users, int capacity): the one local user, as GetUserExistence reports it. */
++static uint32_t list_all_users(int *count,Uid *users,int capacity){
++ if(!count||(capacity>0&&!users)||capacity<0)return 0x7c67;initialize();
++ int n=capacity>0?1:0;if(n)users[0]=local;*count=n;return 0;
++}
+ void runtime_account_uid(uint64_t out[2]){initialize();out[0]=local.lo;out[1]=local.hi;}
+ void *runtime_account_override(const char *name){
+  static const struct{const char *name;void *fn;} entries[]={
+  {"_ZN2nn7account10InitializeEv",initialize},{"_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE",preselected},
+  {"_ZN2nn7account9CloseUserERKNS0_10UserHandleE",close_user},{"_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE",user_id},
+- {"_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE",existence},{"_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE",nickname}};
++ {"_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE",existence},{"_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE",nickname},
++ {"_ZN2nn7account12ListAllUsersEPiPNS0_3UidEi",list_all_users}};
+  for(unsigned i=0;i<sizeof(entries)/sizeof(*entries);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
+ }
+diff --git a/games/totk/runtime/applet_host.c b/games/totk/runtime/applet_host.c
+index aba1197..5a65f6e 100644
+--- a/games/totk/runtime/applet_host.c
++++ b/games/totk/runtime/applet_host.c
+@@ -71,6 +71,16 @@ static void show_error(uint32_t result) {
+     fprintf(stderr, "[totk] game error dialog: %04u-%04u (result %#x)\n", 2000 + (result & 0x1ff), (result >> 9) & 0x1fff, result);
+ }
+ 
++/* ---------- BOTW's platform queries (TOTK never imports these) ----------
++   This host is neither a Switch 2 ("Ounce") nor a Labo VR kit. Reporting that is the truthful answer, and the game then
++   keeps its original-Switch behaviour. EndVrMode is a no-op because VR mode can never have begun; BeginVrMode stops loudly
++   so a request for VR is never answered with a fake success. Recording (the capture button) has nothing to record here. */
++static uint32_t pl_is_running_on_ounce(void) { return 0; }
++static uint32_t pl_is_vr_mode(void) { return 0; }
++static void pl_end_vr_mode(void) { }
++static void pl_begin_vr_mode(void) { runtime_fail("VR mode requested: not supported on this host"); }
++static void oe_enable_recording(void) { }
++
+ void *runtime_applet_override(const char *name) {
+     static const struct { const char *name; void *fn; } map[] = {
+         {"_ZN2nn6applet23GetPreviousProgramIndexEv", previous_program_index},
+@@ -82,6 +92,9 @@ void *runtime_applet_override(const char *name) {
+         {"_ZN2nn2oe44SetUserInactivityDetectionTimeExtendedUnsafeEb", inactivity_extended},
+         {"_ZN2nn2oe17FinishStartupLogoEv", finish_startup_logo}, {"_ZN2nn2oe25TryPopNotificationMessageEPj", try_pop},
+         {"_ZN2nn2oe22PopNotificationMessageEv", pop},
++        {"_ZN2nn2pl16IsRunningOnOunceEv", pl_is_running_on_ounce}, {"_ZN2nn2pl8IsVrModeEv", pl_is_vr_mode},
++        {"_ZN2nn2pl9EndVrModeEv", pl_end_vr_mode}, {"_ZN2nn2pl11BeginVrModeEv", pl_begin_vr_mode},
++        {"_ZN2nn2oe15EnableRecordingEv", oe_enable_recording},
+         {"_ZN2nn5prepo10PlayReport4SaveEv", report_save}, {"_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE", report_save_uid},
+         {"_ZN2nn5prepo28RequestImmediateTransmissionEv", immediate_transmission},
+         {"_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", connection_status},
+diff --git a/games/totk/runtime/audio_mixer.h b/games/totk/runtime/audio_mixer.h
+index 273bd35..33335f7 100644
+--- a/games/totk/runtime/audio_mixer.h
++++ b/games/totk/runtime/audio_mixer.h
+@@ -22,6 +22,7 @@ typedef struct AudioRenderer {
+     AudrenParameter param;
+     pthread_mutex_t lock; pthread_t thread; int running;
+     uint32_t state, revision, time_limit, event; int logged;
++    float voice_drop;   /* SetVoiceDropParameter; 0 = never set, reads back as the 1.0 default */
+     uint64_t behavior_flags, elapsed_frames;
+     uint64_t stop_released, empty_played, flushed, logged_released;   /* wave buffers given back by Stop / without samples / by FlushWaveBuffers */
+     ServerVoice *voices; AudrenPoolIn *pools; AudrenMixIn *mixes; AudrenSinkIn *sinks; AudrenEffectIn *effects; AudrenChannelIn *channels;
+diff --git a/games/totk/runtime/audio_renderer.c b/games/totk/runtime/audio_renderer.c
+index 90cc263..faa26a8 100644
+--- a/games/totk/runtime/audio_renderer.c
++++ b/games/totk/runtime/audio_renderer.c
+@@ -308,6 +308,8 @@ static void renderer_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
+     case 7: rs->copy[rs->ncopy++] = runtime_event_readable(r->event); return;
+     case 8: r->time_limit = IPC_ARG(rq, uint32_t, 0); return;
+     case 9: { uint32_t v = r->time_limit ? r->time_limit : 100; IPC_OUT(rs, v); return; }
++    case 12: r->voice_drop = IPC_ARG(rq, float, 0); return;   /* SetVoiceDropParameter: kept for GetVoiceDropParameter; nothing is dropped, rendering is not time limited here */
++    case 13: { float v = r->voice_drop != 0.0f ? r->voice_drop : 1.0f; IPC_OUT(rs, v); return; }
+     default: ipc_unimplemented(s, rq);
+     }
+ }
+diff --git a/games/totk/runtime/fs_host.c b/games/totk/runtime/fs_host.c
+index 57dc519..a9ddc43 100644
+--- a/games/totk/runtime/fs_host.c
++++ b/games/totk/runtime/fs_host.c
+@@ -352,7 +352,7 @@ void *runtime_fs_host_override(const char *name) {
+         {"_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", mount_save},
+         {"_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", mount_save_ro},
+         {"_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", save_exists},
+-        {"_ZN2nn2fs21MountTemporaryStorageEPKc", mount_temp}, {"_ZN2nn2fs7UnmountEPKc", unmount}, {"_ZN2nn2fs6CommitEPKc", commit},
++        {"_ZN2nn2fs21MountTemporaryStorageEPKc", mount_temp}, {"_ZN2nn2fs7UnmountEPKc", unmount}, {"_ZN2nn2fs6CommitEPKc", commit}, {"_ZN2nn2fs14CommitSaveDataEPKc", commit},   /* BOTW's name for the same call */
+         {"_ZN2nn2fs18CreateCacheStorageEill", create_cache}, {"_ZN2nn2fs18DeleteCacheStorageEi", delete_cache},
+         {"_ZN2nn2fs17MountCacheStorageEPKci", mount_cache},
+         {"_ZN2nn2fs20OpenCacheStorageListEPNS0_22CacheStorageListHandleE", open_cache_list},
+diff --git a/games/totk/runtime/game_patches_v190.c b/games/totk/runtime/game_patches_v190.c
+new file mode 100644
+index 0000000..57d0dd5
+--- /dev/null
++++ b/games/totk/runtime/game_patches_v190.c
+@@ -0,0 +1,20 @@
++/* BOTW 1.9.0 baseline: no game-code patches yet. The game runs at its shipping speed and output size.
++   Frame-rate and output-size patches need BOTW-specific sites (see games/botw/README.md) and are added only after
++   each site is located and its original instruction words are asserted. */
++#include "game_patches.h"
++#include "game_version.h"
++#include <stdio.h>
++#include <string.h>
++
++void runtime_frame_step_pin(double ms) { (void)ms; fprintf(stderr, "[totk] BOTW 1.9.0: frame step is not patched\n"); }
++void runtime_frame_step_update(uint64_t now_ns) { (void)now_ns; }
++
++void runtime_game_patches(Module *m) {
++    if (strcmp(m->name, "main")) runtime_fail("BOTW game patches expect main");
++    fprintf(stderr, "[totk] BOTW 1.9.0: no game patches applied (shipping behaviour)\n");
++}
++
++int runtime_output_res(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
++uint64_t runtime_output_res_extra_bytes(void) { return 0; }
++int runtime_output_res_toggle(void) { return 0; }
++int runtime_output_mode_cycle(void) { return 0; }
+diff --git a/games/totk/runtime/game_version.h b/games/totk/runtime/game_version.h
+index deb16a7..e11c774 100644
+--- a/games/totk/runtime/game_version.h
++++ b/games/totk/runtime/game_version.h
+@@ -1,6 +1,23 @@
+ /* Version-specific main offsets matched against original NSO code.
+    Instruction guards remain mandatory; 1.4.3 also has new SDK modules. */
+ #pragma once
++/* A real file in the game's RomFS that runtime_fs_probe opens and reads. */
++#ifdef TOTK_GAME_V190
++#define GAME_PROBE_STREAM "Sound/Resource/Stream/Amiibo_Hit.bfstm"
++#else
++#define GAME_PROBE_STREAM "Sound/Resource/Stream/Dm_OP_0001.bwav"
++#endif
++/* Per-game names the in-app launcher (app/launcher.m) uses: data folder, log name, game binary, bundle version. */
++#ifdef TOTK_GAME_V190
++#define TOTK_GAME_DATA_NAME "BOTW"
++#define TOTK_GAME_LOG_NAME "botw"
++#define TOTK_GAME_BINARY "botw-native"
++#define TOTK_APP_VERSION "1.9.0"
++#else
++#define TOTK_GAME_DATA_NAME "TOTK"
++#define TOTK_GAME_LOG_NAME "totk"
++#define TOTK_GAME_BINARY "totk-native"
++#endif
+ #define GAME_ADDR_JOIN(x) GAME_ADDR_##x
+ #define GAME_ADDR(x) GAME_ADDR_JOIN(x)
+ #if defined(TOTK_GAME_V143)
+@@ -11,6 +28,20 @@
+ #define GAME_ADDR_0xe995c4 0xbdb48c
+ #define GAME_ADDR_0x2aa4fa0 0x2bb79f0
+ #define GAME_ADDR_0x453f648 0x398b348
++#elif defined(TOTK_GAME_V190)
++/* BOTW 1.9.0. None of TOTK's addresses apply. The sentinel makes any use fail loudly instead of reading TOTK's offsets. */
++#define TOTK_GAME_VERSION "BOTW 1.9.0"
++#define TOTK_GAME_DIR "v190"
++#define GAME_ADDR_0x15ecb0c 0x7ffffff0
++#define GAME_ADDR_0xe995c4 0x7ffffff0
++#define GAME_ADDR_0x2aa4fa0 0x7ffffff0
++#define GAME_ADDR_0x453f648 0x7ffffff0
++#define GAME_ADDR_0x8f6cbc 0x7ffffff0
++#define GAME_ADDR_0x4663f08 0x7ffffff0
++#define GAME_ADDR_0x69a18c 0x7ffffff0
++#define GAME_ACTOR_POS 0
++#define GAME_ACTOR_ROT 0
++#define GAME_OUTPUT_CALL_WORD 0u
+ #elif defined(TOTK_GAME_V112)
+ #define TOTK_GAME_VERSION "1.1.2"
+ #define TOTK_GAME_DIR "v112"
+@@ -90,3 +121,6 @@
+ #define GAME_ADDR_0x8f6cbc 0x8f6cbc
+ #define GAME_OUTPUT_CALL_WORD 0x94000082u
+ #endif
++#ifndef TOTK_APP_VERSION
++#define TOTK_APP_VERSION TOTK_GAME_VERSION
++#endif
+diff --git a/games/totk/runtime/input.c b/games/totk/runtime/input.c
+index bb94b0d..c5e64a2 100644
+--- a/games/totk/runtime/input.c
++++ b/games/totk/runtime/input.c
+@@ -86,6 +86,15 @@ static uint32_t show_controller_support(ControllerSupportResult *out,const void
+  static int once;if(!once++)fprintf(stderr,"[totk] controller support applet: one player on controller %#x\n",pad_id());
+  return 0;
+ }
++/* BOTW's own nn::hid calls (TOTK never imports these). There is one host controller and no seven-six-axis (motion
++   fusion) device, so the sensor lifecycle calls are accepted without effect and the state read reports zero samples.
++   SetNpadJoyAssignmentModeDual would split a Joy-Con pair; a single host controller has nothing to assign. */
++static void seven_sensor_noop(void){static int once;if(!once++)fprintf(stderr,"[totk] seven-six-axis sensor: not provided, no samples\n");}
++static void seven_sensor_initialize(void *work,uint64_t size){(void)work;(void)size;seven_sensor_noop();}
++static int seven_sensor_states(void *out,int max){(void)out;(void)max;return 0;}
++static void gyro_zero_drift_mode(const void *handle,const void *mode){(void)handle;(void)mode;}
++static void joy_assignment_dual(const uint32_t *id){if(id)input_log("joy assignment dual",*id);}
++static uint32_t show_controller_support_simple(const void *arg){return show_controller_support(NULL,arg);}
+ /* Vibration devices and the six-axis sensor: runtime/hid_feedback.c (none unless TOTK_RUMBLE=1 / TOTK_GYRO=1). */
+ void *runtime_input_override(const char *name){
+  void *feedback=runtime_hid_feedback_override(name);if(feedback)return feedback;
+@@ -97,6 +106,12 @@ void *runtime_input_override(const char *name){
+  {"_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE",hold_type},{"_ZN2nn3hid14DisconnectNpadERKj",disconnect},
+  {"_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",show_controller_support},
+  {"_ZN2nn3hid15InitializeMouseEv",initialize_mouse},{"_ZN2nn3hid18InitializeKeyboardEv",initialize_keyboard},
++ {"_ZN2nn3hid28InitializeSevenSixAxisSensorEPvm",seven_sensor_initialize},{"_ZN2nn3hid26FinalizeSevenSixAxisSensorEv",seven_sensor_noop},
++ {"_ZN2nn3hid23StartSevenSixAxisSensorEv",seven_sensor_noop},{"_ZN2nn3hid22StopSevenSixAxisSensorEv",seven_sensor_noop},
++ {"_ZN2nn3hid32ResetSevenSixAxisSensorTimestampEv",seven_sensor_noop},{"_ZN2nn3hid27GetSevenSixAxisSensorStatesEPNS0_23SevenSixAxisSensorStateEi",seven_sensor_states},
++ {"_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE",gyro_zero_drift_mode},
++ {"_ZN2nn3hid28SetNpadJoyAssignmentModeDualERKj",joy_assignment_dual},
++ {"_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE",show_controller_support_simple},
+  {"_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi",mouse_states},{"_ZN2nn3hid16GetKeyboardStateEPNS0_13KeyboardStateE",keyboard_state}};
+  for(unsigned i=0;i<sizeof(entries)/sizeof(*entries);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
+ }
+diff --git a/games/totk/runtime/loader.c b/games/totk/runtime/loader.c
+index 2c150ef..fe6640c 100644
+--- a/games/totk/runtime/loader.c
++++ b/games/totk/runtime/loader.c
+@@ -408,7 +408,7 @@ int runtime_module_offset(uint64_t pc,const char **name,uint64_t *off) {
+  return 0;
+ }
+ uintptr_t runtime_frame_controller_return_pc(void) {
+-#ifdef TOTK_GAME_V143
++#if defined(TOTK_GAME_V143) || defined(TOTK_GAME_V190)
+  return 0; /* The older graphics diagnostic reads the pre-1.4 controller layout. */
+ #else
+  return (uintptr_t)modules[0].base + GAME_ADDR(0x8f6cbc);
+diff --git a/games/totk/runtime/romfs.c b/games/totk/runtime/romfs.c
+index 4d9a789..f97f249 100644
+--- a/games/totk/runtime/romfs.c
++++ b/games/totk/runtime/romfs.c
+@@ -1,4 +1,5 @@
+ /* Read-only game RomFS, backed by the player's fully IVFC-verified image. */
++#include "romfs_mods.h"
+ #include "runtime.h"
+ #include "romfs_config.h"
+ #include "game_version.h"
+@@ -166,6 +167,7 @@ static void overlay_init(void) {
+  unsigned w,h;if(runtime_output_res(&w,&h)&&runtime_output_res_extra_bytes()){const char *out=getenv("TOTK_ROMFS_PATCHES_OUT");char d[4096];
+   need(snprintf(d,sizeof(d),"%s/%ux%u",out?out:"extracted/" TOTK_GAME_DIR "/romfs-patches-out",w,h)<(int)sizeof(d),"RomFS output overlay path");overlay_load(d,1);}
+ }
++static void mods_init(void);
+ void runtime_fs_init(void) {
+  if(image_fd>=0)return;
+  const char *dir=getenv("TOTK_ROMFS");if(!dir)dir="extracted/" TOTK_GAME_DIR "/romfs";char path[4096];
+@@ -187,6 +189,7 @@ void runtime_fs_init(void) {
+  }
+  runtime_boot_status("准备游戏资源","检查分辨率补丁并挂载只读游戏资源");
+  overlay_init();
++ mods_init();
+  fprintf(stderr,"[totk] native read-only RomFS ready: %llu files\n",(unsigned long long)file_count);
+ }
+ static int path_ok(const char *p) {return romfs_path_valid_relative(p);}
+@@ -194,6 +197,25 @@ static const char *rom_path(const char *path) {
+  return romfs_path_relative(mount_name,path);
+ }
+ static uint64_t lower(const char *name) {uint64_t lo=0,hi=file_count;while(lo<hi){uint64_t m=lo+(hi-lo)/2;if(strcmp(entry_name(entry(m)),name)<0)lo=m+1;else hi=m;}return lo;}
++/* RomFS mods (romfs_mods.h): TOTK_MODS_MANIFEST, written by sw-launcher, replaces game files by RomFS path. Built-in
++   overlays win; paths the game does not have are skipped (new files are not supported). No manifest, no change. */
++static mods_bound_t mods;
++static uint32_t handle_mod[NH]; /* mod slot + 1 of an open handle, 0 = none */
++static int64_t mods_find_index(const char *p,void *ctx) {(void)ctx;if(!path_ok(p))return -1;uint64_t i=lower(p);return i<file_count&&!strcmp(entry_name(entry(i)),p)?(int64_t)i:-1;}
++static int mods_builtin(uint64_t i,void *ctx) {(void)ctx;for(unsigned k=0;k<noverlay;k++)if(overlays[k].index==i)return 1;return 0;}
++static void mods_log(const char *line,void *ctx) {(void)ctx;fprintf(stderr,"[totk] %s\n",line);}
++static void mods_init(void) {
++ const char *path=getenv("TOTK_MODS_MANIFEST");if(!path||!*path)return;
++ int fd=open(path,O_RDONLY);struct stat st;need(fd>=0&&fstat(fd,&st)==0&&st.st_size>=0&&st.st_size<(64<<20),"RomFS mods manifest unreadable");
++ char *text=malloc((size_t)st.st_size+1);need(text!=NULL,"RomFS mods manifest memory");
++ need(pread(fd,text,(size_t)st.st_size,0)==st.st_size,"read RomFS mods manifest");close(fd);
++ mods_t m;char err[1400];
++ if(mods_parse(text,(size_t)st.st_size,&m,err,sizeof err)){fprintf(stderr,"[totk] %s\n",err);runtime_fail("RomFS mods manifest invalid");}
++ free(text);
++ if(mods_bind(&m,mods_find_index,mods_builtin,NULL,mods_log,NULL,&mods,err,sizeof err)){fprintf(stderr,"[totk] %s\n",err);runtime_fail("RomFS mod file changed; start the game from the launcher again");}
++ fprintf(stderr,"[totk] RomFS mods: %zu files replace the originals (%zu listed)\n",mods.n,m.n);
++ mods_free(&m);
++}
+ static unsigned mount_rom(const char *name,void *cache,uint64_t size) {
+  (void)cache;(void)size;runtime_fs_init();if(!name||!path_ok(name)||strlen(name)>=sizeof(mount_name)||strchr(name,'/')||strchr(name,':'))return INVALID;
+  if(*mount_name&&strcmp(name,mount_name))runtime_fail("second RomFS mount not implemented");strcpy(mount_name,name);return 0;
+@@ -206,13 +228,14 @@ unsigned runtime_romfs_open(uint64_t *out,const char *path,int mode) {
+  fs_log("rom",path?path:"(null)");
+  if(!out||mode!=1)return UNSUPPORTED;const char *p=rom_path(path);if(!p)return NOT_FOUND;uint64_t i=lower(p);if(i>=file_count||strcmp(p,entry_name(entry(i))))return NOT_FOUND;
+  uint8_t ov=0;for(unsigned k=0;k<noverlay;k++)if(overlays[k].index==i)ov=(uint8_t)(k+1);
+- pthread_mutex_lock(&lock);for(unsigned j=1;j<NH;j++)if(!handles[j]){handles[j]=i+1;handle_ovl[j]=ov;*out=0x100000000ULL+j;pthread_mutex_unlock(&lock);return 0;}pthread_mutex_unlock(&lock);runtime_fail("file handle table full");return INVALID;
++ const mods_bound_entry *md=ov?NULL:mods_bound_find(&mods,i);uint32_t mi=md?(uint32_t)(md-mods.v)+1:0;
++ pthread_mutex_lock(&lock);for(unsigned j=1;j<NH;j++)if(!handles[j]){handles[j]=i+1;handle_ovl[j]=ov;handle_mod[j]=mi;*out=0x100000000ULL+j;pthread_mutex_unlock(&lock);return 0;}pthread_mutex_unlock(&lock);runtime_fail("file handle table full");return INVALID;
+ }
+ static int handle_entry(uint64_t h,Entry *e) {if(h<=0x100000000ULL||h>=0x100000000ULL+NH)return 0;pthread_mutex_lock(&lock);uint64_t i=handles[h-0x100000000ULL];pthread_mutex_unlock(&lock);if(!i)return 0;*e=entry(i-1);return 1;}
+ /* Where an open handle's bytes come from: the overlay file, or the original's range of the image. */
+ static void handle_source(uint64_t h,const Entry *e,int *fd,uint64_t *base,uint64_t *size) {
+- pthread_mutex_lock(&lock);uint8_t ov=handle_ovl[h-0x100000000ULL];pthread_mutex_unlock(&lock);
+- if(ov){*fd=overlays[ov-1].fd;*base=0;*size=overlays[ov-1].size;}else{*fd=image_fd;*base=e->offset;*size=e->size;}
++ pthread_mutex_lock(&lock);uint8_t ov=handle_ovl[h-0x100000000ULL];uint32_t mi=handle_mod[h-0x100000000ULL];pthread_mutex_unlock(&lock);
++ if(ov){*fd=overlays[ov-1].fd;*base=0;*size=overlays[ov-1].size;}else if(mi){*fd=mods.v[mi-1].fd;*base=0;*size=mods.v[mi-1].size;}else{*fd=image_fd;*base=e->offset;*size=e->size;}
+ }
+ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer,uint64_t size) {
+  Entry e;if(!out||offset<0||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,fsize;handle_source(h,&e,&fd,&base,&fsize);if((uint64_t)offset>fsize||(!buffer&&size))return INVALID;
+@@ -230,7 +253,7 @@ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer
+  *out=done;return 0;
+ }
+ unsigned runtime_romfs_size(int64_t *out,uint64_t h) {Entry e;if(!out||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,size;handle_source(h,&e,&fd,&base,&size);*out=(int64_t)size;return 0;}
+-void runtime_romfs_close(uint64_t h) {Entry e;if(!handle_entry(h,&e))runtime_fail("close invalid file handle");pthread_mutex_lock(&lock);handles[h-0x100000000ULL]=0;handle_ovl[h-0x100000000ULL]=0;pthread_mutex_unlock(&lock);}
++void runtime_romfs_close(uint64_t h) {Entry e;if(!handle_entry(h,&e))runtime_fail("close invalid file handle");pthread_mutex_lock(&lock);handles[h-0x100000000ULL]=0;handle_ovl[h-0x100000000ULL]=0;handle_mod[h-0x100000000ULL]=0;pthread_mutex_unlock(&lock);}
+ unsigned runtime_romfs_entry_type(int *out,const char *path) {
+  if(!out)return INVALID;const char *p=rom_path(path);if(!p)return NOT_FOUND;uint64_t i=lower(p);if(i<file_count&&!strcmp(entry_name(entry(i)),p)){*out=1;return 0;}
+  char dir[4096];if(snprintf(dir,sizeof(dir),"%s/",p)>=(int)sizeof(dir))return INVALID;i=lower(dir);if(i<file_count&&!strncmp(entry_name(entry(i)),dir,strlen(dir))){*out=0;return 0;}return NOT_FOUND;
+@@ -248,7 +271,7 @@ void runtime_fs_probe(void) {
+  /* Audio stream paths include an extra slash after the mount root. Verify
+     actual resource lookup and bytes, while still rejecting path traversal. */
+  {
+-  const char *name="Sound/Resource/Stream/Dm_OP_0001.bwav";
++  const char *name=GAME_PROBE_STREAM;
+   char path[256];uint8_t expected[257],actual[257];uint64_t h,n;
+   snprintf(path,sizeof path,"rom:/%s",name);
+   need(!runtime_romfs_open(&h,path,1),"open normal audio path");
+@@ -259,7 +282,7 @@ void runtime_fs_probe(void) {
+    need(!runtime_romfs_open(&h,path,1),"open normalized audio stream path");
+    need(!runtime_romfs_read(&n,h,0,actual,sizeof actual)&&n==sizeof actual&&!memcmp(actual,expected,sizeof actual),"normalized audio stream bytes");runtime_romfs_close(h);
+   }
+-  need(runtime_romfs_open(&h,"rom://../Sound/Resource/Stream/Dm_OP_0001.bwav",1)!=0,"reject traversal after repeated root separator");
++  {char escaped[256];snprintf(escaped,sizeof escaped,"rom://../%s",name);need(runtime_romfs_open(&h,escaped,1)!=0,"reject traversal after repeated root separator");}
+  }
+  for(uint64_t i=0;i<file_count;i+=file_count/64){Entry e=entry(i);char p[4096];need(snprintf(p,sizeof(p),"rom:/%s",entry_name(e))<(int)sizeof(p),"probe path");uint64_t h=0,n=0;int64_t size;need(!runtime_romfs_open(&h,p,1)&&!runtime_romfs_size(&size,h)&&(uint64_t)size==e.size,"probe open/size");need(!runtime_romfs_read(&n,h,0,buffer,sizeof(buffer)),"probe partial read");for(uint64_t j=0;j<n;j++)sum=sum*131+buffer[j];need(!runtime_romfs_read(&n,h,size,buffer,1)&&n==0,"probe EOF");runtime_romfs_close(h);count++;}
+  for(unsigned k=0;k<noverlay;k++){Entry e=entry(overlays[k].index);char p[4096];need(snprintf(p,sizeof(p),"rom:/%s",entry_name(e))<(int)sizeof(p),"probe overlay path");uint64_t oh=0,n=0;int64_t size=0;uint8_t a[64],b[64];
+diff --git a/games/totk/runtime/romfs_mods.c b/games/totk/runtime/romfs_mods.c
+new file mode 100644
+index 0000000..dc94bfa
+--- /dev/null
++++ b/games/totk/runtime/romfs_mods.c
+@@ -0,0 +1,97 @@
++/* See romfs_mods.h. */
++#include "romfs_mods.h"
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++static int path_inside(const char *p) {   /* relative, no empty / . / .. components, no backslash */
++    if (!*p || *p == '/' || strchr(p, '\\')) return 0;
++    for (const char *s = p; *s;) {
++        const char *e = strchr(s, '/'); size_t n = e ? (size_t)(e - s) : strlen(s);
++        if (!n || (n == 1 && s[0] == '.') || (n == 2 && s[0] == '.' && s[1] == '.')) return 0;
++        s += n; if (*s) s++; else break;
++        if (!*s) return 0;   /* trailing slash */
++    }
++    return 1;
++}
++static int by_path(const void *a, const void *b) { return strcmp(((const mods_entry *)a)->path, ((const mods_entry *)b)->path); }
++static int by_index(const void *a, const void *b) {
++    uint64_t x = ((const mods_bound_entry *)a)->index, y = ((const mods_bound_entry *)b)->index; return x < y ? -1 : x > y;
++}
++
++void mods_free(mods_t *m) {
++    for (size_t i = 0; i < m->n; i++) { free(m->v[i].path); free(m->v[i].host); }
++    free(m->v); m->v = NULL; m->n = 0;
++}
++
++int mods_parse(const char *text, size_t len, mods_t *out, char *err, size_t errlen) {
++    out->v = NULL; out->n = 0; size_t cap = 0, line = 0;
++    for (size_t at = 0; at < len;) {
++        const char *s = text + at, *nl = memchr(s, '\n', len - at); size_t n = nl ? (size_t)(nl - s) : len - at;
++        at += n + 1; line++;
++        if (n && s[n - 1] == '\r') n--;
++        if (!n) continue;
++        const char *t1 = memchr(s, '\t', n), *t2 = t1 ? memchr(t1 + 1, '\t', n - (size_t)(t1 + 1 - s)) : NULL;
++        char size_text[24]; size_t sl = t2 ? n - (size_t)(t2 + 1 - s) : 0;
++        if (!t1 || !t2 || t1 == s || t2 == t1 + 1 || !sl || sl >= sizeof size_text || memchr(t2 + 1, '\t', sl)) {
++            snprintf(err, errlen, "mods manifest line %zu: expected <RomFS path>\\t<host path>\\t<size>", line); mods_free(out); return 1; }
++        memcpy(size_text, t2 + 1, sl); size_text[sl] = 0;
++        char *end; errno = 0; unsigned long long size = strtoull(size_text, &end, 10);
++        if (*end || errno || size_text[0] == '-') { snprintf(err, errlen, "mods manifest line %zu: bad size", line); mods_free(out); return 1; }
++        char *path = strndup(s, (size_t)(t1 - s)), *host = strndup(t1 + 1, (size_t)(t2 - t1 - 1));
++        if (!path || !host || !path_inside(path) || host[0] != '/') {
++            snprintf(err, errlen, "mods manifest line %zu: the RomFS path must be relative and inside the game, the host path absolute", line);
++            free(path); free(host); mods_free(out); return 1; }
++        if (out->n == cap) { cap = cap ? cap * 2 : 64; mods_entry *v = realloc(out->v, cap * sizeof *v); if (!v) { free(path); free(host); mods_free(out); snprintf(err, errlen, "out of memory"); return 1; } out->v = v; }
++        out->v[out->n++] = (mods_entry){path, host, size};
++    }
++    /* Sort by path keeping manifest order within a path (mergesort is stable), then keep the last line of each path. */
++    if (out->n && mergesort(out->v, out->n, sizeof *out->v, by_path)) { snprintf(err, errlen, "out of memory"); mods_free(out); return 1; }
++    size_t w = 0;
++    for (size_t i = 0; i < out->n; i++) {
++        if (i + 1 < out->n && !strcmp(out->v[i].path, out->v[i + 1].path)) { free(out->v[i].path); free(out->v[i].host); continue; }
++        out->v[w++] = out->v[i];
++    }
++    out->n = w;
++    return 0;
++}
++
++const mods_entry *mods_find(const mods_t *m, const char *romfs_path) {
++    mods_entry key = {(char *)romfs_path, NULL, 0};
++    return m->n ? bsearch(&key, m->v, m->n, sizeof *m->v, by_path) : NULL;
++}
++
++void mods_bound_free(mods_bound_t *b) {
++    for (size_t i = 0; i < b->n; i++) if (b->v[i].fd >= 0) close(b->v[i].fd);
++    free(b->v); b->v = NULL; b->n = 0;
++}
++
++int mods_bind(const mods_t *m, int64_t (*find_index)(const char *path, void *ctx), int (*builtin)(uint64_t index, void *ctx),
++              void *ctx, void (*log)(const char *line, void *ctx), void *log_ctx, mods_bound_t *out, char *err, size_t errlen) {
++    out->v = m->n ? calloc(m->n, sizeof *out->v) : NULL; out->n = 0;
++    if (m->n && !out->v) { snprintf(err, errlen, "out of memory"); return 1; }
++    char line[1200];
++    for (size_t i = 0; i < m->n; i++) {
++        const mods_entry *e = &m->v[i];
++        int64_t index = find_index(e->path, ctx);
++        if (index < 0) { snprintf(line, sizeof line, "mod: %s not in the game (new files are not supported)", e->path); log(line, log_ctx); continue; }
++        if (builtin(index, ctx)) { snprintf(line, sizeof line, "mod: %s ignored (built-in fix)", e->path); log(line, log_ctx); continue; }
++        int fd = open(e->host, O_RDONLY | O_CLOEXEC); struct stat st;
++        if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != e->size) {
++            if (fd >= 0) close(fd);
++            snprintf(err, errlen, "mod file changed since the launcher listed it: %s (%s)", e->path, e->host);
++            mods_bound_free(out); return 1; }
++        out->v[out->n++] = (mods_bound_entry){(uint64_t)index, e->size, fd};
++    }
++    qsort(out->v, out->n, sizeof *out->v, by_index);
++    return 0;
++}
++
++const mods_bound_entry *mods_bound_find(const mods_bound_t *b, uint64_t index) {
++    mods_bound_entry key = {index, 0, -1};
++    return b->n ? bsearch(&key, b->v, b->n, sizeof *b->v, by_index) : NULL;
++}
+diff --git a/games/totk/runtime/romfs_mods.h b/games/totk/runtime/romfs_mods.h
+new file mode 100644
+index 0000000..cdf0038
+--- /dev/null
++++ b/games/totk/runtime/romfs_mods.h
+@@ -0,0 +1,25 @@
++/* RomFS mods: files the launcher lists in a manifest replace the game's files of the same RomFS path.
++   The manifest (TOTK_MODS_MANIFEST, written by sw-launcher before each start) is UTF-8 text, one file per line:
++   <RomFS path>\t<absolute host path>\t<size in bytes>. A later line for the same path wins (the launcher writes mods in
++   load order). Mod files are not hashed; their size is checked once at start, so a file changed after the launcher listed
++   it stops the start instead of being read half-way. */
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++
++typedef struct { char *path, *host; uint64_t size; } mods_entry;
++typedef struct { mods_entry *v; size_t n; } mods_t;                     /* sorted by path, one entry per path */
++typedef struct { uint64_t index, size; int fd; } mods_bound_entry;
++typedef struct { mods_bound_entry *v; size_t n; } mods_bound_t;         /* sorted by RomFS file index */
++
++int mods_parse(const char *text, size_t len, mods_t *out, char *err, size_t errlen);
++const mods_entry *mods_find(const mods_t *m, const char *romfs_path);
++void mods_free(mods_t *m);
++
++/* Opens the mod files that replace files the game has. find_index returns the RomFS file index of a path or -1; builtin
++   says whether a built-in fix already replaces that file (it wins). Skipped files are reported through log. Returns 0, or
++   non-zero with err set (a mod file is missing or its size changed). */
++int mods_bind(const mods_t *m, int64_t (*find_index)(const char *path, void *ctx), int (*builtin)(uint64_t index, void *ctx),
++              void *ctx, void (*log)(const char *line, void *ctx), void *log_ctx, mods_bound_t *out, char *err, size_t errlen);
++const mods_bound_entry *mods_bound_find(const mods_bound_t *b, uint64_t index);
++void mods_bound_free(mods_bound_t *b);
+diff --git a/games/totk/runtime/world_survey.c b/games/totk/runtime/world_survey.c
+index dd40706..18226a4 100644
+--- a/games/totk/runtime/world_survey.c
++++ b/games/totk/runtime/world_survey.c
+@@ -14,7 +14,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-#if defined(TOTK_GAME_V143)
++#if defined(TOTK_GAME_V143) || defined(TOTK_GAME_V190)
+ _Atomic int runtime_survey_pending;
+ void runtime_survey_init(Module *m) {
+     (void)m;
+diff --git a/games/totk/scripts/prepare_romfs_backend.py b/games/totk/scripts/prepare_romfs_backend.py
+index 90dee7d..110919e 100644
+--- a/games/totk/scripts/prepare_romfs_backend.py
++++ b/games/totk/scripts/prepare_romfs_backend.py
+@@ -3,9 +3,11 @@
+ import argparse,hashlib,json,struct
+ from pathlib import Path
+ root=Path(__file__).resolve().parents[1]
+-parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--version', choices=('v0','v112','v143'), default='v0');version=parser.parse_args().version
+-out=root/('build' if version=='v0' else f'build/{version}');out.mkdir(parents=True,exist_ok=True)
+-folder=root/f'extracted/{version}/romfs';manifest=json.loads((folder/'index.json').read_text())
++parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--version', choices=('v0','v112','v143','v190'), default='v0')
++parser.add_argument('--data-root', type=Path, help='directory holding extracted/ and receiving build/ (default: this game folder; v190 is BOTW 1.9.0)')
++args=parser.parse_args();version=args.version;data=args.data_root.resolve() if args.data_root else root
++out=data/('build' if version=='v0' else f'build/{version}');out.mkdir(parents=True,exist_ok=True)
++folder=data/f'extracted/{version}/romfs';manifest=json.loads((folder/'index.json').read_text())
+ assert manifest['status']=='pass' and (folder/'romfs.bin').stat().st_size==manifest['romfs_size']
+ strings=bytearray();rows=bytearray()
+ for item in manifest['files']:
+diff --git a/games/totk/scripts/prepare_runtime.py b/games/totk/scripts/prepare_runtime.py
+index 528d4cb..74128c0 100644
+--- a/games/totk/scripts/prepare_runtime.py
++++ b/games/totk/scripts/prepare_runtime.py
+@@ -12,26 +12,31 @@ ROOT = Path(__file__).resolve().parents[1]
+ sys.path.insert(0, str(ROOT / 'third_party/d2r'))
+ from relr import decode_relr
+ parser = argparse.ArgumentParser(description=__doc__)
+-parser.add_argument('--version', choices=('v0','v112','v143'), default='v0')
+-version = parser.parse_args().version
+-OUT = ROOT / ('build' if version == 'v0' else f'build/{version}')
++parser.add_argument('--version', choices=('v0','v112','v143','v190'), default='v0')
++parser.add_argument('--data-root', type=Path, help='directory holding extracted/, rewritten/ and analysis/, and receiving build/ (default: this game folder; v190 is BOTW 1.9.0)')
++args = parser.parse_args()
++version = args.version
++DATA = args.data_root.resolve() if args.data_root else ROOT
++OUT = DATA / ('build' if version == 'v0' else f'build/{version}')
+ OUT.mkdir(parents=True, exist_ok=True)
+-report = json.loads((ROOT / ('analysis/phase12-validation.json' if version == 'v0' else f'analysis/{version}-port/phase12-validation.json')).read_text())
++report = json.loads((DATA / ('analysis/phase12-validation.json' if version == 'v0' else f'analysis/{version}-port/phase12-validation.json')).read_text())
+ assert report['status'] == 'pass' and report['rom_version'] == version
+ if version == 'v112':
+     expected = 'f04fbebdaacbcde0bcca20cbe0caff06bd51f7c8f904d217e5f17efe3308d1ac'
+     assert report['module_file_sha256']['extracted/v112/exefs/main'] == expected, 'Unsupported 1.1.2 main image'
+ if version == 'v143':
+     assert report['module_file_sha256']['extracted/v143/exefs/main'] == 'e84a90d551fed0824b4b74933b9c6d043c458521363a7cea58b2faca1822dc9e', 'Unsupported 1.4.3 main image'
++if version == 'v190':
++    assert report['module_file_sha256']['extracted/v190/exefs/main'] == 'f6f0b20bb1f2b67d164c24871cd473147eef1d285f12e7bd492e3126c6022e27', 'Unsupported BOTW 1.9.0 main image'
+ modules = []
+ for name in ['main', 'subsdk0', 'sdk']:
+-    path = ROOT / f'rewritten/{version}/{name}.patched.bin'
++    path = DATA / f'rewritten/{version}/{name}.patched.bin'
+     image = path.read_bytes()
+     digest = hashlib.sha256(image).hexdigest()
+-    assert digest == report['module_file_sha256'][str(path.relative_to(ROOT))], 'Unverified rewrite'
+-    inv = json.loads((ROOT / f'extracted/{version}/elf/{name}-inventory.json').read_text())
++    assert digest == report['module_file_sha256'][str(path.relative_to(DATA))], 'Unverified rewrite'
++    inv = json.loads((DATA / f'extracted/{version}/elf/{name}-inventory.json').read_text())
+     layout = {}
+-    for line in (ROOT / f'rewritten/{version}/{name}.fixups.tsv').read_text().splitlines():
++    for line in (DATA / f'rewritten/{version}/{name}.fixups.tsv').read_text().splitlines():
+         _, key, value = line.split()
+         layout[key] = int(value, 0)
+     mod0 = struct.unpack_from('<I', image, 4)[0]
+@@ -48,7 +53,7 @@ for name in ['main', 'subsdk0', 'sdk']:
+     else:
+         # Newer SDK modules carry GNU hash only. NSO's verified dynsym extent
+         # supplies the exact count, as in prepare_modules.py's inventory gate.
+-        raw_header = (ROOT / f'extracted/{version}/exefs/{name}').read_bytes()[:256]
++        raw_header = (DATA / f'extracted/{version}/exefs/{name}').read_bytes()[:256]
+         _, _, symbol_offset, symbol_size = struct.unpack_from('<IIII', raw_header, 0x90)
+         assert layout['RO_OFF'] + symbol_offset == tags[6] and symbol_size % 24 == 0
+         assert 0 < symbol_size <= layout['DATA_OFF'] - tags[6]
+@@ -75,12 +80,12 @@ for name in ['main', 'subsdk0', 'sdk']:
+             relocated.add(where)
+             relocs.append(dict(where=where, kind=kind, symbol=si, addend=addend))
+     gates = []
+-    for line in (ROOT / f'rewritten/{version}/{name}.gates.tsv').read_text().splitlines():
++    for line in (DATA / f'rewritten/{version}/{name}.gates.tsv').read_text().splitlines():
+         ret, kind, arg, original = line.split()
+         assert kind in ['cntpct', 'cntvct', 'svc']
+         gates.append(dict(ret=int(ret, 0), timer=kind != 'svc', arg=int(arg), original=int(original, 0)))
+     # Match each compiler's actual DT_INIT state load before decoding it.
+-    flag_reg, load_offset = (19, 20) if version == 'v143' else (20, 24)
++    flag_reg, load_offset = (19, 20) if version in ('v143', 'v190') else (20, 24)
+     a, w = struct.unpack_from('<I', image, tags[12]+16)[0], struct.unpack_from('<I', image, tags[12]+load_offset)[0]
+     assert a & 0x9f00001f == 0x90000000 | flag_reg and w & 0xffc003ff == 0xb9400008 | (flag_reg << 5)
+     imm = ((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2)
+@@ -94,7 +99,7 @@ for name in ['main', 'subsdk0', 'sdk']:
+ main = modules[0]
+ target = '_ZN2nn2os13GetSystemTickEv'
+ slot = next(r['where'] for r in main['relocs'] if main['symbols'][r['symbol']]['name'] == target and r['kind'] == 1026)
+-image = (ROOT / f'rewritten/{version}/main.patched.bin').read_bytes()
++image = (DATA / f'rewritten/{version}/main.patched.bin').read_bytes()
+ plt = []
+ for address in range(main['layout']['TEXT_END'] - 0x10000, main['layout']['TEXT_END'] - 12, 4):
+     a, b, c, d = struct.unpack_from('<IIII', image, address)
+@@ -127,5 +132,5 @@ lines.append('};')
+ lines.append(f'#define PROBE_PLT {main["probe_plt"]}ULL\n#define PROBE_SLOT {slot}ULL')
+ (OUT / 'runtime_tables.h').write_text('\n'.join(lines) + '\n')
+ # Details are evidence, not additional source code.
+-(ROOT / ('analysis/runtime-layout.json' if version == 'v0' else f'analysis/{version}-port/runtime-layout.json')).write_text(json.dumps(modules, indent=2) + '\n')
++(DATA / ('analysis/runtime-layout.json' if version == 'v0' else f'analysis/{version}-port/runtime-layout.json')).write_text(json.dumps(modules, indent=2) + '\n')
+ print(json.dumps(dict(modules=len(modules), relocations=sum(len(m['relocs']) for m in modules), original_main_plt=hex(plt[0]), original_main_slot=hex(slot))))
+diff --git a/games/totk/third_party/d2r/patch_nso.py b/games/totk/third_party/d2r/patch_nso.py
+index cf65362..73f4c8a 100644
+--- a/games/totk/third_party/d2r/patch_nso.py
++++ b/games/totk/third_party/d2r/patch_nso.py
+@@ -634,6 +634,12 @@ SIGNED_TABLES = {'277178b7dba1b6d4949a84778d4abc58': {
+     0x598ef4: (0x598ee4, 0x2d89038, (680,688,20,696,704,712,720,-5688,-2640), '12000010207ab0b85202008bdef747f940021fd6'),
+     0x5f2a9c: (0x5f2a90, 0x2d892e0, (884,892,16,900,-6516), 'f0030f2a12000010207ab0b85202008b40021fd6'),
+     0x6397d8: (0x6397cc, 0x2d88e7c, (1376,1384,16,1392,1400,1408,-7264), 'fb0301aa12000010207ab0b85202008b40021fd6'),
++}, # BOTW 1.9.0 main: ldrsw x18,[xN,x18,lsl #2]; add x18,x18,xN; br x18 with xN = the table address (adrp+add), 9 entries each.
++   # Entry 0 is the instruction after the br and entry 4 is the b.hi default target, which cross-checks the table.
++   'cd57b23fa4bbad65803d9788c01821ee': {
++    0x37df10: (0x16a78e4, 0x16a78e4, (-20093392, -20093004, -20092640, -20092348, -20089864, -20092160, -20091472, -20090868, -20090332), '5f220071c86e0054527bb2b852021a8b40021fd6'),
++    0x37ee84: (0x16a7908, 0x16a7908, (-20089472, -20089092, -20088736, -20088452, -20086004, -20088268, -20087588, -20086992, -20086464), '5f220071e86c0054527bb2b852021a8b40021fd6'),
++    0x37fdbc: (0x16a7950, 0x16a7950, (-20085648, -20085256, -20084888, -20084592, -20082084, -20084400, -20083704, -20083096, -20082556), '5f220071e86f0054727bb2b852021b8b40021fd6'),
+ }}
+ funcs = sorted({func_of(a) for a, (k, _) in kinds.items() if k == 'x18'})
+ for fa, fb in funcs:
+diff --git a/games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c b/games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
+index 87b1ad5..69039b8 100644
+--- a/games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
++++ b/games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c
+@@ -136,9 +136,12 @@ static int call_stats_on(void);
+ static void call_stats_end(const void *cb, const uint8_t *copy);
+ NVN(nvnDeviceBuilderSetDefaults, void, NVNdeviceBuilder *b) { memset(b, 0, sizeof(dev_builder_t)); }
+ NVN(nvnDeviceBuilderSetFlags, void, NVNdeviceBuilder *b, int f) { ((dev_builder_t *)b)->flags = f; }
++// NVN's default depth mode is NEAR_IS_MINUS_W (enum 0, the memset value below); BOTW never calls nvnDeviceSetDepthMode and relies on it
++static _Atomic int g_depth_near_minus_w = 1;
+ NVN(nvnDeviceInitialize, NVNboolean, NVNdevice *d, const NVNdeviceBuilder *b) {
+     dev_t_ *o = (dev_t_ *)d; memset(o, 0, sizeof *o);
+     o->magic = MAGIC('D', 'E', 'V', 0); o->flags = ((const dev_builder_t *)b)->flags;
++    o->depth_mode = NVN_DEPTH_MODE_NEAR_IS_MINUS_W; atomic_store(&g_depth_near_minus_w, 1);
+     OLOG("DeviceInitialize %p flags=%#x", (void *)d, o->flags);
+     return 1;
+ }
+@@ -197,7 +200,6 @@ NVN(nvnDeviceInstallDebugCallback, void, NVNdevice *d, const PFNNVNDEBUGCALLBACK
+     dev_t_ *o = (dev_t_ *)d; o->dbg_cb = B(enable) ? (void *)cb : NULL; o->dbg_data = data;
+ }
+ NVN(nvnDeviceSetWindowOriginMode, void, NVNdevice *d, NVNwindowOriginMode m) { ((dev_t_ *)d)->origin = m; LOG("[nvn] 窗口原点 %s", m ? "左上（同 D3D / Metal）" : "左下（GL）"); }
+-static _Atomic int g_depth_near_minus_w;
+ int totk_depth_near_minus_w(void) { return atomic_load(&g_depth_near_minus_w); }
+ NVN(nvnDeviceSetDepthMode, void, NVNdevice *d, NVNdepthMode m) { ((dev_t_ *)d)->depth_mode = m; atomic_store(&g_depth_near_minus_w, m == NVN_DEPTH_MODE_NEAR_IS_MINUS_W); LOG("[nvn] 深度模式 %s", m ? "近=0（同 D3D / Metal）" : "近=-w（GL）：顶点着色器翻译时做 z=(z+w)/2 转换"); }
+ NVN(nvnDeviceFinalizeCommandHandle, void, NVNdevice *d, NVNcommandHandle h) { (void)d; (void)h; }
+diff --git a/tests/test_botw_build_args.py b/tests/test_botw_build_args.py
+new file mode 100644
+index 0000000..efe4fee
+--- /dev/null
++++ b/tests/test_botw_build_args.py
+@@ -0,0 +1,42 @@
++"""Argument handling of the BOTW build entry (no game files needed)."""
++from pathlib import Path
++import sys
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++sys.path.insert(0, str(ROOT / 'games/botw/scripts'))
++
++import build_app  # noqa: E402
++import build_botw  # noqa: E402
++
++
++class BotwBuildArgs(unittest.TestCase):
++    def test_update_required(self):
++        with self.assertRaises(SystemExit) as raised:
++            build_botw.parse_args(['b.nsp', '-k', 'k'])
++        self.assertIn('BOTW needs the 1.9.0 update', str(raised.exception))
++
++    def test_title_routes_to_botw(self):
++        args = build_app.parse_args(['--title', 'botw', 'b.nsp', '--update', 'u.nsp', '-k', 'k'])
++        self.assertEqual(args.title, 'botw')
++
++    def test_default_title_is_totk(self):
++        args = build_app.parse_args(['g.xci', '-k', 'k'])
++        self.assertEqual(args.title, 'totk')
++
++
++if __name__ == '__main__':
++    unittest.main()
++
++
++class BotwErrors(unittest.TestCase):
++    def test_botw_error_is_one_line(self):
++        """build_app.py run as a script must turn a BOTW BuildError into its one-line ERROR, not a traceback."""
++        import subprocess, tempfile
++        with tempfile.TemporaryDirectory() as d:
++            r = subprocess.run([sys.executable, str(ROOT / 'build_app.py'), '--title', 'botw', f'{d}/missing.nsp',
++                                '--update', f'{d}/u.nsp', '-k', f'{d}/k'], capture_output=True, text=True)
++        self.assertEqual(r.returncode, 1, r.stderr)
++        self.assertIn('ERROR: no such file', r.stderr)
++        self.assertNotIn('Traceback', r.stderr)
+diff --git a/tests/test_botw_romfs_damage.py b/tests/test_botw_romfs_damage.py
+new file mode 100644
+index 0000000..af8a7ec
+--- /dev/null
++++ b/tests/test_botw_romfs_damage.py
+@@ -0,0 +1,45 @@
++"""The one tolerated damage in the BOTW 1.9.0 RomFS (no game files needed)."""
++from pathlib import Path
++import sys
++import unittest
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'games/botw/scripts'))
++from romfs_damage import ALLOWED, check_damage, parse_bad_blocks  # noqa: E402
++
++FILES = [('Actor/Pack/X.sbactorpack', 0x1000, 0x8000), (ALLOWED, 0x10000, 0x140000), ('Pack/Bootup.pack', 0x150000, 0x4000)]
++
++
++class Damage(unittest.TestCase):
++    def test_no_damage(self):
++        v = check_damage([], FILES)
++        self.assertEqual((v.ok, v.known, v.offending), (True, False, []))
++
++    def test_known_damage_only(self):
++        v = check_damage([(0x20000, 0x24000), (0x24000, 0x28000)], FILES)
++        self.assertEqual((v.ok, v.known, v.offending), (True, True, []))
++
++    def test_damage_elsewhere(self):
++        v = check_damage([(0x2000, 0x3000)], FILES)
++        self.assertEqual((v.ok, v.offending), (False, ['Actor/Pack/X.sbactorpack']))
++
++    def test_mixed(self):
++        v = check_damage([(0x20000, 0x24000), (0x150000, 0x150010)], FILES)
++        self.assertEqual((v.ok, v.offending), (False, ['Pack/Bootup.pack']))
++
++    def test_damage_outside_any_file(self):
++        v = check_damage([(0x0, 0x200)], FILES)
++        self.assertEqual((v.ok, v.offending), (False, ['<RomFS metadata>']))
++
++    def test_parse_hactool_log(self):
++        log = ('MNG_BADBLOCK data_ofs=1c4c000 ofs=20000 len=4000 src=PATCH\n'
++               'MNG_BADBLOCK data_ofs=1c4c000 ofs=24000 len=4000 src=BASE\n'
++               'MNG_BADBLOCK data_ofs=c000 ofs=0 len=4000 src=PATCH\n'
++               '        Level 5 (FAIL):\n            Data Offset:            0x000001c4c000\n')
++        blocks = parse_bad_blocks(log)
++        self.assertEqual(blocks.data, [(0x20000, 0x24000)])
++        self.assertEqual(blocks.base_data, [(0x24000, 0x28000)])
++        self.assertTrue(blocks.hash_tree)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_launcher_names.py b/tests/test_launcher_names.py
+new file mode 100644
+index 0000000..83bae90
+--- /dev/null
++++ b/tests/test_launcher_names.py
+@@ -0,0 +1,39 @@
++"""The in-app launcher (games/totk/app/launcher.m) uses each game's own folders and binary."""
++from pathlib import Path
++import re
++import subprocess
++import unittest
++
++GAME = Path(__file__).resolve().parents[1] / 'games/totk'
++
++
++def preprocess(*defines):
++    r = subprocess.run(['xcrun', 'clang', '-E', '-P', '-x', 'objective-c', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *defines,
++                        'app/launcher.m'], cwd=GAME, capture_output=True, text=True)
++    if r.returncode:
++        raise AssertionError(r.stderr)
++    text = r.stdout[r.stdout.index('int main('):]
++    return re.sub(r'"\s*@?"', '', text)   # join adjacent string literals as the compiler does
++
++
++class LauncherNames(unittest.TestCase):
++    def test_botw(self):
++        text = preprocess('-DTOTK_GAME_V190=1')
++        self.assertIn('MacNativeGames/BOTW', text)
++        self.assertIn('botw.log', text)
++        self.assertIn('build/botw-native', text)
++        self.assertNotIn('"TOTK"', text)
++        self.assertNotIn('MacNativeGames/TOTK', text)
++        self.assertIn('TOTK_MODS_MANIFEST', text)
++
++    def test_totk_unchanged(self):
++        for defines in ((), ('-DTOTK_GAME_V143=1',)):
++            text = preprocess(*defines)
++            self.assertIn('MacNativeGames/TOTK', text)
++            self.assertIn('totk.log', text)
++            self.assertIn('build/totk-native', text)
++            self.assertIn('TOTK_MODS_MANIFEST', text)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_romfs_mods.c b/tests/test_romfs_mods.c
+new file mode 100644
+index 0000000..4c89c80
+--- /dev/null
++++ b/tests/test_romfs_mods.c
+@@ -0,0 +1,70 @@
++/* RomFS mods manifest (games/totk/runtime/romfs_mods.c), without game files. */
++#include "../games/totk/runtime/romfs_mods.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++static int failed;
++#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); failed++; } } while (0)
++
++static const char *GAME[] = {"Actor/A.bin", "Pack/Bootup.pack", "UI/Font.bfarc"};
++static int64_t find_index(const char *path, void *ctx) { (void)ctx; for (int i = 0; i < 3; i++) if (!strcmp(path, GAME[i])) return i; return -1; }
++static int builtin_none(uint64_t index, void *ctx) { (void)index; (void)ctx; return 0; }
++static int builtin_pack(uint64_t index, void *ctx) { (void)ctx; return index == 1; }
++static char logbuf[4096];
++static void log_line(const char *line, void *ctx) { (void)ctx; strncat(logbuf, line, sizeof logbuf - strlen(logbuf) - 2); strcat(logbuf, "\n"); }
++
++static void write_file(const char *path, size_t n) { FILE *f = fopen(path, "wb"); for (size_t i = 0; i < n; i++) fputc('x', f); fclose(f); }
++
++int main(void) {
++    char dir[] = "/tmp/romfs-mods-XXXXXX"; if (!mkdtemp(dir)) return 1;
++    char a[256], b[256], text[2048], err[256];
++    snprintf(a, sizeof a, "%s/a.bin", dir); write_file(a, 10);
++    snprintf(b, sizeof b, "%s/b.bin", dir); write_file(b, 20);
++    mods_t m;
++
++    /* test_parse_and_find */
++    snprintf(text, sizeof text, "Actor/A.bin\t%s\t10\nPack/Bootup.pack\t%s\t20\nNew/File.txt\t%s\t10\n", a, b, a);
++    CHECK(mods_parse(text, strlen(text), &m, err, sizeof err) == 0);
++    CHECK(m.n == 3);
++    CHECK(mods_find(&m, "Actor/A.bin") && mods_find(&m, "Actor/A.bin")->size == 10);
++    CHECK(mods_find(&m, "Pack/Bootup.pack") && !strcmp(mods_find(&m, "Pack/Bootup.pack")->host, b));
++    CHECK(mods_find(&m, "Nope") == NULL);
++
++    /* test_unknown_path_is_skipped and test_builtin_wins */
++    mods_bound_t bound; logbuf[0] = 0;
++    CHECK(mods_bind(&m, find_index, builtin_pack, NULL, log_line, NULL, &bound, err, sizeof err) == 0);
++    CHECK(bound.n == 1 && bound.v[0].index == 0 && bound.v[0].size == 10 && bound.v[0].fd >= 0);
++    CHECK(strstr(logbuf, "mod: New/File.txt not in the game (new files are not supported)") != NULL);
++    CHECK(strstr(logbuf, "mod: Pack/Bootup.pack ignored (built-in fix)") != NULL);
++    CHECK(mods_bound_find(&bound, 0) == &bound.v[0] && mods_bound_find(&bound, 2) == NULL);
++    mods_bound_free(&bound); mods_free(&m);
++
++    /* test_size_mismatch_fails_at_start */
++    snprintf(text, sizeof text, "Actor/A.bin\t%s\t11\n", a);
++    CHECK(mods_parse(text, strlen(text), &m, err, sizeof err) == 0);
++    CHECK(mods_bind(&m, find_index, builtin_none, NULL, log_line, NULL, &bound, err, sizeof err) != 0);
++    CHECK(strstr(err, "mod file changed since the launcher listed it: Actor/A.bin") != NULL);
++    mods_free(&m);
++
++    /* test_bad_line_fails */
++    snprintf(text, sizeof text, "Actor/A.bin\t%s\t10\nBroken line\n", a);
++    CHECK(mods_parse(text, strlen(text), &m, err, sizeof err) != 0);
++    CHECK(strstr(err, "line 2") != NULL);
++
++    /* test_duplicate_path_last_wins */
++    snprintf(text, sizeof text, "Actor/A.bin\t%s\t10\nActor/A.bin\t%s\t20\n", a, b);
++    CHECK(mods_parse(text, strlen(text), &m, err, sizeof err) == 0);
++    CHECK(m.n == 1 && mods_find(&m, "Actor/A.bin")->size == 20);
++    mods_free(&m);
++
++    /* paths must stay inside the RomFS */
++    snprintf(text, sizeof text, "../etc/passwd\t%s\t10\n", a);
++    CHECK(mods_parse(text, strlen(text), &m, err, sizeof err) != 0);
++
++    unlink(a); unlink(b); rmdir(dir);
++    if (failed) return 1;
++    printf("romfs mods: all cases pass\n");
++    return 0;
++}
+diff --git a/tests/test_romfs_mods.py b/tests/test_romfs_mods.py
+new file mode 100644
+index 0000000..fb1b2fe
+--- /dev/null
++++ b/tests/test_romfs_mods.py
+@@ -0,0 +1,27 @@
++"""Compile and exercise the RomFS mods manifest code without game files."""
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class RomfsMods(unittest.TestCase):
++    def test_manifest(self):
++        compiler = shutil.which('cc') or shutil.which('clang')
++        if not compiler:
++            self.skipTest('A C compiler is required')
++        with tempfile.TemporaryDirectory() as directory:
++            exe = Path(directory) / 'test-romfs-mods'
++            build = subprocess.run([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror', str(ROOT / 'tests/test_romfs_mods.c'),
++                                    str(ROOT / 'games/totk/runtime/romfs_mods.c'), '-o', str(exe)], capture_output=True, text=True)
++            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
++            result = subprocess.run([str(exe)], capture_output=True, text=True)
++            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++            self.assertIn('romfs mods: all cases pass', result.stdout)
++
++
++if __name__ == '__main__':
++    unittest.main()

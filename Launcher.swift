@@ -176,12 +176,11 @@ final class Model: ObservableObject {
 
     /// The build tool is pinned to the upstream commit the compatibility patch was made and tested against.
     static let baseCommit = "41e1e0caf43d58c4af3c478ca2d1bafd9dba7093"
-    static var patchPath: String { Bundle.main.path(forResource: "totk-mac-fixes", ofType: "patch") ?? "" }
+    /// Applied in this order on top of baseCommit: the Mac fixes of v1.0, then the BOTW port and RomFS mods (sw-port.patch).
+    nonisolated static var patchPaths: [String] { ["totk-mac-fixes", "sw-port"].map { Bundle.main.path(forResource: $0, ofType: "patch") ?? "" } }
 
     static func projectInstallCommand(_ project: String) -> String {
-        "set -e; d='\(project)'; if [ -e \"$d\" ] && [ -n \"$(ls -A \"$d\" 2>/dev/null)\" ]; then echo \"目录已存在且不是空的：$d\"; exit 1; fi; " +
-        "mkdir -p \"$d\" && cd \"$d\" && git init -q && git remote add origin https://github.com/ly05010419/MacNativeGames && " +
-        "git fetch --depth 1 origin \(baseCommit) && git checkout -q FETCH_HEAD && git apply -p1 '\(patchPath)'"
+        installCommand(project: project, baseCommit: baseCommit, patches: patchPaths)
     }
 
     static func makeDeps(project: String) -> [Dep] {
@@ -195,8 +194,8 @@ final class Model: ObservableObject {
                 install: .background("/opt/homebrew/bin/brew install opus libvpx")),
             Dep(id: "project", title: "构建工具（MacNativeGames）", detail: project, size: "约 50 MB", required: true,
                 install: .background(projectInstallCommand(project))),
-            Dep(id: "patch", title: "Mac 兼容补丁", detail: "内存布局回退（M1 / macOS 27）、并行预热、预编译着色器、语言设置", size: nil, required: true,
-                install: .background("cd '\(project)' && git apply -p1 --check '\(Model.patchPath)' && git apply -p1 '\(Model.patchPath)'")),
+            Dep(id: "patch", title: "Mac 兼容补丁与旷野之息移植", detail: "内存布局回退、并行预热、预编译着色器、语言设置；旷野之息移植和 Mods。已装过旧版构建工具时，点安装只补打缺少的补丁", size: nil, required: true,
+                install: .background(patchesCommand(project: project, patches: Model.patchPaths))),
             Dep(id: "xcode", title: "Xcode（完整版）", detail: "下载 Metal Toolchain 需要", size: "约 7 GB", required: false,
                 install: .link("macappstore://apps.apple.com/app/xcode/id497799835")),
             Dep(id: "metal", title: "Metal Toolchain", detail: "预编译着色器，缓存不会被系统清掉，启动快几十倍", size: "839 MB", required: false,
@@ -219,9 +218,7 @@ final class Model: ObservableObject {
                 case "python": results[id] = FileManager.default.fileExists(atPath: "/opt/homebrew/opt/python@3.14/bin/python3.14") || FileManager.default.fileExists(atPath: "/opt/homebrew/bin/python3.14")
                 case "libs": results[id] = ["opus", "libvpx"].allSatisfy { FileManager.default.fileExists(atPath: "/opt/homebrew/opt/\($0)") }
                 case "project": results[id] = FileManager.default.fileExists(atPath: project + "/build_app.py")
-                case "patch":
-                    let services = (try? String(contentsOfFile: project + "/games/totk/runtime/services.c", encoding: .utf8)) ?? ""
-                    results[id] = services.contains("compact_layout") && FileManager.default.fileExists(atPath: project + "/games/totk/tools/bake_metallibs.py")
+                case "patch": results[id] = sh(patchCheckCommand(project: project, patches: Model.patchPaths)).status == 0
                 case "xcode": results[id] = FileManager.default.fileExists(atPath: "/Applications/Xcode.app")
                 case "metal": results[id] = sh("xcrun -sdk macosx metal --version >/dev/null 2>&1").status == 0
                 case "disk":
@@ -1174,8 +1171,8 @@ struct SettingsView: View {
             HStack(spacing: 14) {
                 IconView(image: model.appIcon, size: 64)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("王国之泪 启动器").font(.system(size: 18, weight: .bold))
-                    Text("版本 1.0.1 · 需要 macOS 26+ 与 Metal 4").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text("sw-launcher").font(.system(size: 18, weight: .bold))
+                    Text("版本 1.1.0 · 王国之泪 / 旷野之息（实验性）· 需要 macOS 26+ 与 Metal 4").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }
             Text("这个启动器只负责检测环境、调用构建脚本、导入存档和启动游戏。游戏本体、密钥和固件都必须是你自己的，启动器不包含任何游戏内容。").font(.system(size: 12)).foregroundStyle(.secondary)
@@ -1218,7 +1215,7 @@ struct LauncherApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("王国之泪 启动器") {
+        WindowGroup("sw-launcher") {
             MainView(model: model).preferredColorScheme(.dark)
         }
         .windowStyle(.hiddenTitleBar)

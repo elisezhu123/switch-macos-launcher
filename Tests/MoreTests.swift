@@ -106,7 +106,33 @@ func testStaleHolderIsIdle() {
     if case .idle = runState(for: .botw, home: home) {} else { expect(false, "start time mismatch means not our game") }
 }
 
+
+// MARK: Task 9
+func shellParses(_ cmd: String) -> Bool {
+    let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-n", "-c", cmd]
+    try! p.run(); p.waitUntilExit(); return p.terminationStatus == 0
+}
+
+func testInstallCommandAppliesBothPatchesInOrder() {
+    let c = installCommand(project: "/p", baseCommit: "abc", patches: ["/r/totk-mac-fixes.patch", "/r/sw-port.patch"])
+    guard let a = c.range(of: "totk-mac-fixes.patch"), let b = c.range(of: "sw-port.patch") else { return expect(false, "both patches named") }
+    expect(a.lowerBound < b.lowerBound, "first patch first")
+    expect(c.contains("git fetch --depth 1 origin abc"), "pinned commit")
+    let u = patchesCommand(project: "/p", patches: ["/r/totk-mac-fixes.patch", "/r/sw-port.patch"])
+    expect(u.contains("--reverse --check") && shellParses(u), "update command skips applied patches and parses")
+}
+
+func testInstallCommandQuotesPaths() {
+    let weird = "/Users/x/它's dir/sw-port.patch"
+    let c = installCommand(project: "/Users/x/My 'Tools'", baseCommit: "abc", patches: [weird])
+    expect(shellParses(c), "install command parses")
+    expect(shellParses(patchesCommand(project: "/Users/x/My 'Tools'", patches: [weird])), "update command parses")
+    expect(shellParses(patchCheckCommand(project: "/Users/x/My 'Tools'", patches: [weird])), "check command parses")
+    expect(shQuote("a'b") == "'a'\\''b'", "quote: \(shQuote("a'b"))")
+}
+
 var extraTests: [(String, () -> Void)] = [
+    ("testInstallCommandAppliesBothPatchesInOrder", testInstallCommandAppliesBothPatchesInOrder), ("testInstallCommandQuotesPaths", testInstallCommandQuotesPaths),
     ("testIdleWhenNoLock", testIdleWhenNoLock), ("testOtherGameRunningBlocksLaunch", testOtherGameRunningBlocksLaunch),
     ("testStaleHolderIsIdle", testStaleHolderIsIdle),
     ("testScanBothLayouts", testScanBothLayouts), ("testLaterModWins", testLaterModWins),
