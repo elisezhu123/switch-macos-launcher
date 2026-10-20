@@ -1,0 +1,223 @@
+diff -urN a/games/totk/runtime/services.c b/games/totk/runtime/services.c
+--- a/games/totk/runtime/services.c	2026-10-18 17:21:08
++++ b/games/totk/runtime/services.c	2026-10-20 21:50:29
+@@ -36,6 +36,7 @@
+ #define STACK_SIZE 0x10000000ULL
+ #define HEAP_OFF (STACK_OFF+STACK_SIZE+0x10000000ULL)
+ static uint8_t *alias_space,*low_space,*heap;
++static int compact_layout;   /* macOS fallback: stack, heap and alias share one block */
+ static size_t heap_size;
+ static unsigned char alias_pages[ALIAS_SIZE_MAX/4096];
+ /* 4 KiB guest pages that are unmapped but whose host 16 KiB page is still committed with old contents: only these are
+@@ -57,7 +58,7 @@
+ #if TARGET_OS_IPHONE
+ #define ASLR_SIZE (ALIAS_START+ALIAS_SIZE-(uintptr_t)low_space)   /* iOS: everything the process can map ends far below 2^39 */
+ #else
+-#define ASLR_SIZE (GUEST_ADDRESS_LIMIT-(uintptr_t)low_space)
++#define ASLR_SIZE (compact_layout?(ALIAS_START+ALIAS_SIZE-(uintptr_t)low_space):(GUEST_ADDRESS_LIMIT-(uintptr_t)low_space))
+ #endif
+ static uint8_t *reserve_fixed(uint64_t at,uint64_t size){
+  mach_vm_address_t a=at;   /* FIXED without OVERWRITE: fails instead of replacing an existing mapping */
+@@ -72,10 +73,20 @@
+  if(!low_space)runtime_fail("reserve guest stack, heap and alias regions");
+  alias_space=low_space+LOW_SIZE;
+ #else
++ /* Some Macs (observed: M1 Max, macOS 27) leave nothing reservable below 0x70_0000_0000 and only ~23 GiB free above it.
++    When the standard layout does not fit, fall back to the iOS-style single block (stack+heap, then alias) from
++    0x70_0000_0000, with a 12 GiB alias region unless TOTK_ALIAS_GIB says otherwise. */
++ if(!getenv("TOTK_ALIAS_GIB")){uint8_t *t=reserve_fixed(ALIAS_SPACE_AT,ALIAS_SIZE_MAX);
++  if(t)mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)t,ALIAS_SIZE_MAX);else setenv("TOTK_ALIAS_GIB","12",1);}
+  alias_space=reserve_fixed(ALIAS_SPACE_AT,ALIAS_SIZE);
+- if(!alias_space)runtime_fail("reserve the 64 GiB alias region at 0x70_0000_0000");
+- for(uint64_t at=LOW_SEARCH_FROM;at+LOW_SIZE<=ALIAS_SPACE_AT&&!low_space;at+=1ULL<<30)low_space=reserve_fixed(at,LOW_SIZE);
+- if(!low_space)runtime_fail("reserve guest stack and heap regions below 2^39");
++ if(alias_space)for(uint64_t at=LOW_SEARCH_FROM;at+LOW_SIZE<=ALIAS_SPACE_AT&&!low_space;at+=1ULL<<30)low_space=reserve_fixed(at,LOW_SIZE);
++ if(!alias_space||!low_space){
++  if(alias_space)mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)alias_space,ALIAS_SIZE);
++  alias_space=NULL;
++  for(uint64_t at=ALIAS_SPACE_AT;at+LOW_SIZE+ALIAS_SIZE<=GUEST_ADDRESS_LIMIT&&!low_space;at+=1ULL<<30)low_space=reserve_fixed(at,LOW_SIZE+ALIAS_SIZE);
++  if(!low_space)runtime_fail("reserve guest stack, heap and alias regions below 2^39");
++  alias_space=low_space+LOW_SIZE;compact_layout=1;
++ }
+ #endif
+  heap=low_space+HEAP_OFF;
+  fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx)\n",(unsigned long long)ALIAS_START,ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,HEAP_CAP);
+@@ -202,7 +213,13 @@
+ static uint64_t desired_language(void) {
+  const char *explicit=getenv("TOTK_LANG");char code[8]={0};
+  if(explicit){if(strlen(explicit)>7)runtime_fail("language code too long");memcpy(code,explicit,strlen(explicit));}
+- else {
++ else {   /* a double-clicked app has no environment: <profile>/../language.txt (e.g. zh-Hans, zh-Hant, ja) picks the language, otherwise the macOS one */
++  const char *profile=getenv("TOTK_PROFILE_DIR");char path[1024];FILE *file;
++  if(profile&&snprintf(path,sizeof path,"%s/../language.txt",profile)<(int)sizeof path&&(file=fopen(path,"r"))){
++   char word[8]={0};if(fscanf(file,"%7s",word)==1)memcpy(code,word,strlen(word));fclose(file);
++  }
++ }
++ if(!code[0]){
+   CFLocaleRef locale=CFLocaleCopyCurrent();char language[16]={0};
+   CFStringRef value=CFLocaleGetValue(locale,kCFLocaleLanguageCode);
+   if(value)CFStringGetCString(value,language,sizeof(language),kCFStringEncodingUTF8);CFRelease(locale);
+diff -urN a/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m b/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m
+--- a/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m	2026-10-18 17:21:08
++++ b/games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m	2026-10-20 21:50:29
+@@ -4705,7 +4705,24 @@
+     if (nbad) MLOG("【红】着色器 %s（阶段 %d）读驱动段的这些位置回放层不填，读到 0：%s", o->key, o->stage, bad);
+     return nunfill;
+ }
+-static uint64_t g_rt_prebuilt, g_rt_compiled;   // TOTK: translated variants loaded precompiled (iOS) / compiled from MSL here
++#if !TARGET_OS_IPHONE
++/* The options stamp games/totk/tools/bake_metallibs.py writes next to the baked libraries: they were built with exactly the
++   options totk_precise_opts() gives the runtime compile (MSL 4.1, safe math, default fp32 functions). No stamp or a different
++   one: nothing baked is used. TOTK_NO_METALLIB=1 turns baked libraries off; TOTK_FAST_MATH=1 does too (it changes the options). */
++#define RT_METALLIB_SIG "metal4.1;math=safe;fp32=fast"
++static int rt_metallib_usable(void) {
++    static int ok = 0; static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        const char *off = getenv("TOTK_NO_METALLIB"), *fm = getenv("TOTK_FAST_MATH");
++        NSString *s = [NSString stringWithContentsOfFile:[totk_rt_dir() stringByAppendingString:@"/metallib.sig"] encoding:NSUTF8StringEncoding error:nil];
++        s = [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
++        ok = !(off && atoi(off)) && !(fm && atoi(fm)) && [s isEqualToString:@RT_METALLIB_SIG];
++        MLOG("预编译着色器库（%s）：%s", RT_METALLIB_SIG, ok ? "使用" : "不使用（没有匹配的 metallib.sig，或被环境变量关闭）");
++    });
++    return ok;
++}
++#endif
++static uint64_t g_rt_prebuilt, g_rt_compiled;   // TOTK: translated variants loaded precompiled (baked on macOS, shaders.pack on iOS) / compiled from MSL here
+ static NvShader *shader_load(NSString *pc, int stage) {
+     NSError *e = nil;
+     // TOTK: runtime translations are MSL source compiled here (macOS allows runtime compilation); the OS caches compiled code.
+@@ -4718,6 +4735,13 @@
+         // iOS: the variant precompiled on the Mac (ios/tools/build_metallibs.sh, same options) if it came in shaders.pack
+         NSString *rt_lib = [NSString stringWithFormat:@"%@/%@.metallib", totk_rt_dir(), pc];
+         if ([NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("【红】预编译着色器库加载失败 %s：%s（改为现编）", pc.UTF8String, e.localizedDescription.UTF8String); else g_rt_prebuilt++; }
++#else
++        // macOS: a library baked offline next to the source (games/totk/tools/bake_metallibs.py) survives the system shader cache
++        // being evicted; used only while the options stamp matches, otherwise the source is compiled here as before.
++        if (rt_metallib_usable()) {
++            NSString *rt_lib = [NSString stringWithFormat:@"%@/%@.metallib", totk_rt_dir(), pc];
++            if ([NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("【红】预编译着色器库加载失败 %s：%s（改为现编）", pc.UTF8String, e.localizedDescription.UTF8String); else g_rt_prebuilt++; }
++        }
+ #endif
+         if (!lib) { NSString *src = [NSString stringWithContentsOfFile:rt_src encoding:NSUTF8StringEncoding error:&e];
+                     if (src) { lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e]; g_rt_compiled++; } }
+@@ -6161,6 +6185,33 @@
+     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);   // 不是可有可无的后台活：它决定玩家进局前管线是否就绪 | Not optional background work: it decides whether the pipelines are ready before the player enters a run
+     dispatch_queue_t q = dispatch_queue_create("dm.nvn.pso-warm", attr);
+     atomic_store(&g_warm_running, 1);
++#if !TARGET_OS_IPHONE
++    /* The serial warm-up is bound by one Metal compiler service process (one core). Compile the same MSL sources on
++       several threads first, only to fill the system Metal shader cache: the libraries are dropped, so the serial worker
++       below finds each source already compiled. TOTK_WARM_THREADS sets the count (default 6; 0 or 1 turns this off). */
++    {
++        const char *te = getenv("TOTK_WARM_THREADS"); int nthreads = te ? atoi(te) : 6;
++        if (nthreads > 1 && g_dev) {
++            MTLCompileOptions *opts = totk_precise_opts();   // first call initializes a static: do it on this thread
++            NSString *rtdir = totk_rt_dir();
++            NSOperationQueue *pq = [NSOperationQueue new];
++            pq.name = @"dm.nvn.pso-prefetch"; pq.maxConcurrentOperationCount = nthreads; pq.qualityOfService = NSQualityOfServiceUserInitiated;
++            NSUInteger nsrc = 0;
++            for (NSString *f in files) {
++                if (![f hasSuffix:@".metal"]) continue;
++                nsrc++;
++                [pq addOperationWithBlock:^{ @autoreleasepool {
++                    if (!atomic_load(&g_warm_running)) return;
++                    if (rt_metallib_usable() && [NSFileManager.defaultManager fileExistsAtPath:[rtdir stringByAppendingPathComponent:[[f stringByDeletingPathExtension] stringByAppendingPathExtension:@"metallib"]]]) return;   // baked: nothing to warm
++                    NSString *msl =[NSString stringWithContentsOfFile:[rtdir stringByAppendingPathComponent:f] encoding:NSUTF8StringEncoding error:nil];
++                    if (!msl || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"]) return;
++                    NSError *pe = nil; (void)[g_dev newLibraryWithSource:msl options:opts error:&pe];
++                }}];
++            }
++            MLOG("并行预编译：%lu 个着色器源码，%d 个线程（只暖系统着色器缓存；TOTK_WARM_THREADS=1 关）", (unsigned long)nsrc, nthreads);
++        }
++    }
++#endif
+     dispatch_async(q, ^{ warm_worker(paths,files,eligible,planned_keys,total,shader_total,pipeline_total); });
+     // The title's seed manifest must be ready before its first frame. The
+     // profile-specific list and remaining translated variants finish behind
+diff -urN a/games/totk/tools/bake_metallibs.py b/games/totk/tools/bake_metallibs.py
+--- a/games/totk/tools/bake_metallibs.py	1970-01-01 08:00:00
++++ b/games/totk/tools/bake_metallibs.py	2026-10-20 21:50:29
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++"""Bake the translated shader sources (<key>.metal) of a shader cache directory into <key>.metallib next to them.
++
++The game compiles each translated shader from MSL source at run time; macOS keeps the result in a small shared system cache
++that other Metal programs can evict, and a cold start then costs minutes. A library baked here is a plain file the game loads
++in milliseconds and nothing else can evict it. It needs Apple's Metal Toolchain (xcodebuild -downloadComponent MetalToolchain).
++
++The options match totk_precise_opts() in nvn_mtl.m: MSL 4.1, safe math, default fp32 functions. metallib.sig records them; the
++game uses the baked libraries only while the stamp matches, so a change here must change RT_METALLIB_SIG there as well.
++
++    python3 games/totk/tools/bake_metallibs.py ~/Library/Application\\ Support/MacNativeGames/TOTK/shader-cache/rt-totk-native-v4-unverified
++"""
++import argparse
++import concurrent.futures
++import os
++import subprocess
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++SIG = 'metal4.1;math=safe;fp32=fast'
++FLAGS = ['-std=metal4.1', '-fmetal-math-mode=safe']
++
++
++def bake_one(source: Path, out: Path, tmpdir: Path) -> str | None:
++    tmp = tmpdir / (out.name + f'.{os.getpid()}.tmp')
++    try:
++        proc = subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', *FLAGS, '-o', str(tmp), str(source)],
++                              capture_output=True, text=True)
++        if proc.returncode or not tmp.is_file() or tmp.stat().st_size < 4:
++            return (proc.stderr or proc.stdout or 'no output').strip().splitlines()[0][:200] if (proc.stderr or proc.stdout) else 'no output'
++        if tmp.read_bytes()[:4] != b'MTLB':
++            return 'output is not a Metal library'
++        os.replace(tmp, out)   # same volume: readers never see a partial file
++        return None
++    finally:
++        tmp.unlink(missing_ok=True)
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument('cache_dir', type=Path, help='shader cache directory holding the <key>.metal files')
++    ap.add_argument('-j', '--jobs', type=int, default=min(8, max(1, (os.cpu_count() or 4) - 2)))
++    ap.add_argument('--limit', type=int, default=0, help='bake at most this many (testing)')
++    ap.add_argument('--force', action='store_true', help='rebake libraries that already exist')
++    args = ap.parse_args()
++    root = args.cache_dir.expanduser()
++    if not root.is_dir():
++        print(f'no such directory: {root}', file=sys.stderr)
++        return 2
++    if subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '--version'], capture_output=True).returncode:
++        print('the Metal Toolchain is missing: xcodebuild -downloadComponent MetalToolchain', file=sys.stderr)
++        return 2
++    sig_path = root / 'metallib.sig'
++    old = sig_path.read_text().strip() if sig_path.is_file() else None
++    if old != SIG:   # libraries built with other options must not be mixed in
++        for stale in root.glob('*.metallib'):
++            stale.unlink()
++        sig_path.write_text(SIG + '\n')
++    todo = [p for p in sorted(root.glob('*.metal')) if args.force or not p.with_suffix('.metallib').exists()]
++    if args.limit:
++        todo = todo[:args.limit]
++    total = len(todo)
++    print(f'{total} to bake ({len(list(root.glob("*.metal")))} sources), {args.jobs} at a time', flush=True)
++    failed, t0 = [], time.time()
++    with tempfile.TemporaryDirectory(prefix='.bake-', dir=root) as td, \
++            concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
++        futures = {pool.submit(bake_one, p, p.with_suffix('.metallib'), Path(td)): p for p in todo}
++        for n, fut in enumerate(concurrent.futures.as_completed(futures), 1):
++            error = fut.result()
++            if error:
++                failed.append((futures[fut].name, error))
++            if n % 200 == 0 or n == total:
++                print(f'  {n}/{total}  {time.time() - t0:.0f}s  failed {len(failed)}', flush=True)
++    for name, error in failed[:10]:
++        print(f'FAILED {name}: {error}', file=sys.stderr)
++    print(f'done: {total - len(failed)} baked, {len(failed)} failed, {time.time() - t0:.0f}s')
++    return 1 if failed else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
