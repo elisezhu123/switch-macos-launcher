@@ -2,7 +2,7 @@
 # Build "sw-launcher.app" for macOS 15+ on Apple silicon.
 set -e
 cd "$(dirname "$0")"
-VERSION="${1:-1.1.0}"
+VERSION="${1:-1.2.0}"
 APP="sw-launcher.app"
 rm -rf "$APP" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos15.0 Launcher.swift LauncherCore.swift NXCatalog.swift -o "$APP/Contents/MacOS/sw-launcher"

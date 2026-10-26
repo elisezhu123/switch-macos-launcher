@@ -2,7 +2,7 @@
 # Build the launcher, strip the quarantine attribute and pack it for a GitHub release.
 set -e
 cd "$(dirname "$0")/.."
-VERSION="${1:-1.1.0}"
+VERSION="${1:-1.2.0}"
 ./build.sh "$VERSION"
 APP="sw-launcher.app"
 xattr -cr "$APP"                                   # no com.apple.quarantine inside the bundle we ship
