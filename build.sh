@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 VERSION="${1:-1.1.0}"
 APP="sw-launcher.app"
 rm -rf "$APP" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos15.0 Launcher.swift LauncherCore.swift -o "$APP/Contents/MacOS/sw-launcher"
+swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos15.0 Launcher.swift LauncherCore.swift NXCatalog.swift -o "$APP/Contents/MacOS/sw-launcher"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

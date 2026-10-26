@@ -353,7 +353,7 @@ final class Model: ObservableObject {
     // MARK: language, save, build, launch
 
     func applyLanguage() {
-        for g in GameKind.allCases {   // the game reads <data folder>/language.txt
+        for g in GameKind.macnativeGames {   // the game reads <data folder>/language.txt
             let support = GamePaths(g, home: Paths.home).support
             try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
             try? (s.language + "\n").write(to: support.appendingPathComponent("language.txt"), atomically: true, encoding: .utf8)
@@ -489,7 +489,7 @@ extension Model {
         let status: Status
     }
 
-    var entries: [Entry] { GameKind.allCases.map(entry) }
+    var entries: [Entry] { GameKind.macnativeGames.map(entry) }
 
     func entry(_ g: GameKind) -> Entry {
         let gs = s.games[g.rawValue] ?? GameSettings()
@@ -1032,7 +1032,7 @@ struct SettingsView: View {
     /// Which game the per-game fields (game file, update, save, mods, output) belong to.
     var gamePicker: some View {
         Picker("游戏", selection: $model.s.selected) {
-            ForEach(GameKind.allCases) { g in Text(g.displayName + (g.experimental ? "（实验性）" : "")).tag(g) }
+            ForEach(GameKind.macnativeGames) { g in Text(g.displayName + (g.experimental ? "（实验性）" : "")).tag(g) }
         }.pickerStyle(.segmented).disabled(model.busy != nil)
     }
 

@@ -77,7 +77,7 @@ func testSettingsRoundTrip() {
             ("testMigratesV101Settings", testMigratesV101Settings), ("testBotwPaths", testBotwPaths),
             ("testTotkPathsUnchanged", testTotkPathsUnchanged), ("testBotwDefaults", testBotwDefaults),
             ("testSettingsRoundTrip", testSettingsRoundTrip),
-        ] + extraTests
+        ] + extraTests + nxTests
         for (name, t) in all { let f = failures; t(); if failures > f { print("  in \(name)") } }
         if failures == 0 { print("ALL PASS (\(all.count) tests)") } else { print("\(failures) FAILED"); exit(1) }
     }
