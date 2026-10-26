@@ -10,11 +10,11 @@
 
 一个 Ryujinx 风格的 macOS 启动器，用来在 **Apple 芯片 Mac** 上构建并运行**你自己拥有的**游戏。
 
-> **支持两款游戏：《塞尔达传说 王国之泪》（TOTK）和《塞尔达传说 旷野之息》（BOTW，实验性）。** 别的游戏现在不能用。
+> **两个后端，共 71 个条目：**
+> - **MacNativeGames**：《塞尔达传说 王国之泪》（1.0.0 / 1.1.2 / 1.4.3）和《旷野之息》（1.9.0，实验性）。保留原有的多线程着色器预热、预编译烘焙和 RomFS Mods。
+> - **nxnative**（[seedds/nxnative](https://github.com/seedds/nxnative)，见 [AppleGamingWiki 教程](https://www.applegamingwiki.com/wiki/Nxnative_Switch_to_Mac_conversion)）：**69 款游戏**，每款按它的档案支持对应版本，例如《超级马力欧兄弟 惊奇》1.0.0 / 1.0.1 / 1.2.1、《路易吉洋馆3》1.4.0、《火焰纹章 Engage》2.0.0、《怪物猎人 崛起》16.0.2。完整列表在启动器的游戏库里，装好 nxnative 后点“更新 nxnative 与游戏列表”还会自动读到它新增的游戏和版本。
 >
-> v1.1.0 起启动器改名为 **sw-launcher**（原名“王国之泪启动器”）。旧版的设置会自动迁移，已经构建好的王国之泪 App 不用重新构建。
-
-本项目**基于 [MacNativeGames](https://github.com/ly05010419/MacNativeGames)（MIT，作者 ly05010419）衍生**：构建与运行游戏的核心全部来自它；本仓库提供图形化启动器，以及两份补丁：针对 M1 / macOS 27 的兼容与加速补丁，和旷野之息移植加 Mods 支持的补丁。启动器只记录并执行“怎么移植”，游戏文件只在你自己的 Mac 上处理。
+> v1.2.0 加入 nxnative 后端。旧版设置自动沿用，已经构建好的 App 不用重新构建。
 
 ### 重要声明（请务必阅读）
 
@@ -44,6 +44,17 @@
 - **存档**：选择存档文件夹后一键导入，**覆盖前自动备份**。
 - **构建**：调用 MacNativeGames 的构建脚本，显示 4 步进度；自动准备一份清理过的 `prod.keys` 副本（去掉会让 hactool 报错的行，原文件不动）。
 - **启动**：检测到"内存地址预留失败"时自动重试（见下文），不用手动再开。重试时只等上一次启动自己退出，不会结束任何进程。
+
+### nxnative 后端（v1.2.0）
+
+- **构建**：游戏本体 + 对应版本的更新（文件名要带 `[v版本号]`）+ 可选 DLC + `prod.keys`，**不需要固件**。启动器用 `scripts/build_ipa_from_nsp.py --platform mac-app --progress json` 构建，进度条读它的 JSON 事件；游戏文件只做符号链接（nxnative 要求一个文件夹一款游戏），不复制。
+- **环境**：Xcode（选用并同意许可）、Metal Toolchain、git / zstd / spirv-cross / lz4 / glslang、.NET SDK 10、nxnative 本体，以及装在启动器自己 Python 环境里的 capstone / fonttools / lz4 / nsz。每一项都要你点“安装”。
+- **多线程**：设置 → 图形里的“着色器预热线程数”写成 `DM_PSO_PREPARE_THREADS`（默认等于 CPU 核心数）。
+- **Mods**：沿用同一份 mods 列表（开关、顺序、冲突），启动时转成 nxnative 自带的 `DM_ROMFS_OVERLAY`：先读 mod 里的文件，没有的再读原版；不用重新构建。
+- **其他设置**（帧率 30/60、渲染比例、主机/掌机、MetalFX、手柄震动、Metal 4 管线等）按游戏保存，写进 `~/Library/Application Support/nxnative/<标题ID>/env.txt` 里启动器自己的那一段；你手写在段外的行优先。语言只在游戏支持时写入（读构建时解出的 `control.nacp`）。
+- **存档**在 `~/Library/Application Support/nxnative/<标题ID>/save`，日志在 `~/Library/Logs/nxnative/<标题ID>.log`。
+- **未验证**：整条 nxnative 构建流程（装依赖、30–60 分钟的首次构建、启动）没有在真机上完整跑过；命令生成、设置、env.txt、overlay、进度解析、运行检测有单元测试。遇到问题请先看日志。
+- nxnative 的游戏目录由 `scripts/gen-catalog.py` 从它的 `dm/games` 生成到 `NXCatalog.swift`。
 
 ### 相对上游的改进（`totk-mac-fixes.patch`）
 
@@ -113,6 +124,7 @@
 | 文件 | 作用 |
 |---|---|
 | `Launcher.swift` | 启动器界面（SwiftUI） |
+| `NXCatalog.swift`、`scripts/gen-catalog.py` | nxnative 的 69 款游戏及版本（生成） |
 | `LauncherCore.swift`、`Tests/` | 不涉及界面的逻辑（游戏、路径、设置迁移、Mods、运行状态）和它的测试 |
 | `totk-mac-fixes.patch` | 对 MacNativeGames 的第一个补丁（内存回退、多线程预热、预编译着色器、语言设置、烘焙脚本） |
 | `sw-port.patch` | 第二个补丁，打在第一个之后：旷野之息 1.9.0 移植、构建入口（`build_app.py --title botw`）、RomFS Mods |
