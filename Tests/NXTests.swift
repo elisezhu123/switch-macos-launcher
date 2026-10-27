@@ -211,9 +211,9 @@ func testNxCommands() {
     let i = nxBuildCommand(venv: "/v", stage: "/s", keys: "/k", app: "/Apps/G.ipa", target: .ipa)
     expect(i.contains("--platform ios -o '/Apps/G.ipa'") && i.hasSuffix("--progress json"), "ipa command: \(i)")
     expect(nxIPAPath(app: "/Apps/G.app") == "/Apps/G.ipa" && nxWorkspacePath(stage: "/a/b/stage") == "/a/b/sw-launcher.xcworkspace", "ios paths")
-    var ls = LauncherSettings(); ls.nxTarget = .ipa; ls.teamID = "T"; ls.freeAppleID = false
+    var ls = LauncherSettings(); ls.nxTarget = .ipa; ls.teamID = "T"; ls.freeAppleID = false; ls.nxWorkspace = "/w.xcworkspace"
     let back = try? JSONDecoder().decode(LauncherSettings.self, from: JSONEncoder().encode(ls))
-    expect(back?.nxTarget == .ipa && back?.teamID == "T" && back?.freeAppleID == false, "ios settings round-trip")
+    expect(back?.nxTarget == .ipa && back?.teamID == "T" && back?.freeAppleID == false && back?.nxWorkspace == "/w.xcworkspace", "ios settings round-trip")
     expect(nxCloneCommand(dir: "/d").contains("git clone --depth 1 https://github.com/seedds/nxnative.git '/d'"), "clone")
     expect(nxVenvCommand(venv: "/v").contains("PYLZ4_USE_SYSTEM_LZ4=0") && nxVenvCommand(venv: "/v").contains("--no-binary lz4"), "lz4 built from source")
     expect(nxToolPath(venv: "/v").hasPrefix("/v/bin:/opt/homebrew/bin") && nxToolPath(venv: "/v").contains("/usr/local/share/dotnet"), "tool path")

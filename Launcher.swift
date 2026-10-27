@@ -569,6 +569,15 @@ final class Model: ObservableObject {
         }
     }
 
+    /// Finder save panel for an output path (an .app, .ipa or .xcworkspace); returns the chosen path.
+    func pickSave(title: String, current: String) -> String? {
+        let url = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
+        let p = NSSavePanel()
+        p.title = title; p.canCreateDirectories = true
+        p.directoryURL = url.deletingLastPathComponent(); p.nameFieldStringValue = url.lastPathComponent
+        return p.runModal() == .OK ? p.url?.path : nil
+    }
+
     func pick(directory: Bool, extensions: [String] = [], title: String) -> String? {
         let p = NSOpenPanel()
         p.title = title; p.canChooseFiles = !directory || !extensions.isEmpty; p.canChooseDirectories = directory
@@ -736,7 +745,7 @@ extension Model {
         let keys = (s.keys as NSString).expandingTildeInPath, app = (gs.outputApp as NSString).expandingTildeInPath
         let stage = (gs.workDir as NSString).expandingTildeInPath
         let target = s.nxTarget, teamID = s.teamID.trimmingCharacters(in: .whitespaces), free = s.freeAppleID
-        let ipa = nxIPAPath(app: app), workspace = nxWorkspacePath(stage: stage)
+        let ipa = nxIPAPath(app: app), workspace = s.nxWorkspace.trimmingCharacters(in: .whitespaces).isEmpty ? nxWorkspacePath(stage: stage) : (s.nxWorkspace as NSString).expandingTildeInPath
         let output = target == .ipa ? ipa : app
         let files = stageInputs(game: gs.game, update: gs.update, dlcFolder: gs.dlc)
         Task {
@@ -1394,12 +1403,17 @@ struct SettingsView: View {
                             Toggle("免费 Apple ID（不申请“增大内存限制”，大型游戏可能被系统关闭）", isOn: $model.s.freeAppleID)
                         }
                         labeled("nxnative 目录", $model.s.nxDir)
-                        labeled("生成的 App", $model.s.outputApp)
-                        labeled("构建文件夹（放游戏文件的链接和中间文件）", $model.s.workDir)
+                        labeled(model.s.nxTarget == .ipa ? "生成位置（IPA 与此同名，后缀换成 .ipa）" : "生成的 App", $model.s.outputApp, choose: appPicker)
+                        labeled("构建文件夹（放游戏文件的链接和中间文件）", $model.s.workDir, choose: workPicker)
+                        if model.s.nxTarget == .xcode {
+                            labeled("Xcode 工作区（留空 = 构建文件夹旁的 sw-launcher.xcworkspace）", $model.s.nxWorkspace) {
+                                model.pickSave(title: "选择 Xcode 工作区位置", current: model.s.nxWorkspace.isEmpty ? nxWorkspacePath(stage: (model.s.workDir as NSString).expandingTildeInPath) : model.s.nxWorkspace)
+                            }
+                        }
                     } else {
                         labeled("构建工具目录", $model.s.projectDir)
-                        labeled("生成的 App", $model.s.outputApp)
-                        labeled("构建缓存目录", $model.s.workDir)
+                        labeled("生成的 App", $model.s.outputApp, choose: appPicker)
+                        labeled("构建缓存目录", $model.s.workDir, choose: workPicker)
                     }
                 }.padding(.top, 8)
             }.font(.system(size: 12))
@@ -1438,12 +1452,18 @@ struct SettingsView: View {
             .font(.system(size: 11)).foregroundStyle(.secondary)
     }
 
-    func labeled(_ title: String, _ binding: Binding<String>) -> some View {
+    func labeled(_ title: String, _ binding: Binding<String>, choose: (() -> String?)? = nil) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title).font(.system(size: 11)).foregroundStyle(.secondary)
-            TextField("", text: binding).textFieldStyle(.roundedBorder).font(.system(size: 12))
+            HStack(spacing: 6) {
+                TextField("", text: binding).textFieldStyle(.roundedBorder).font(.system(size: 12))
+                if let choose { Button("选择…") { if let p = choose() { binding.wrappedValue = p } } }
+            }
         }
     }
+
+    func appPicker() -> String? { model.pickSave(title: "选择生成位置", current: model.s.outputApp) }
+    func workPicker() -> String? { model.pick(directory: true, title: "选择构建文件夹") }
 
     var systemTab: some View {
         let i = model.info
