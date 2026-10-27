@@ -52,6 +52,7 @@
 - **多线程**：设置 → 图形里的“着色器预热线程数”写成 `DM_PSO_PREPARE_THREADS`（默认等于 CPU 核心数）。
 - **Mods**：沿用同一份 mods 列表（开关、顺序、冲突），启动时转成 nxnative 自带的 `DM_ROMFS_OVERLAY`：先读 mod 里的文件，没有的再读原版；不用重新构建。
 - **其他设置**（帧率 30/60、渲染比例、主机/掌机、MetalFX、手柄震动、Metal 4 管线等）按游戏保存，写进 `~/Library/Application Support/nxnative/<标题ID>/env.txt` 里启动器自己的那一段；你手写在段外的行优先。语言只在游戏支持时写入（读构建时解出的 `control.nacp`）。
+- **iPad / iPhone**（v1.3.0）：设置 → 高级 → “构建目标”可选 Xcode 工程（推荐）或 IPA。Xcode 工程：构建完自动打开，登录自己的 Apple ID（免费的也行）、选 Personal Team、连上 iPad 点 Run；免费账号签名 7 天过期，重新 Run 即可，且不能申请“增大内存限制”（大型游戏可能被系统关闭）。IPA：用 Sideloadly / AltStore 签名安装。iOS 构建需要 Xcode，**整条流程未在真机验证**。
 - **存档**在 `~/Library/Application Support/nxnative/<标题ID>/save`，日志在 `~/Library/Logs/nxnative/<标题ID>.log`。
 - **未验证**：整条 nxnative 构建流程（装依赖、30–60 分钟的首次构建、启动）没有在真机上完整跑过；命令生成、设置、env.txt、overlay、进度解析、运行检测有单元测试。遇到问题请先看日志。
 - nxnative 的游戏目录由 `scripts/gen-catalog.py` 从它的 `dm/games` 生成到 `NXCatalog.swift`。

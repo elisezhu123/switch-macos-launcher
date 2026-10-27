@@ -180,9 +180,11 @@ struct LauncherSettings: Codable {
     /// Keyed by GameKind.rawValue (a String key keeps the JSON a plain object). Only games the player touched are in here.
     var games: [String: GameSettings] = [:]
     var keys = "", firmware = "", language = "zh-Hans", projectDir = "", nxDir = ""
+    /// nxnative only: what to build (Mac app, iPhone/iPad Xcode project, or IPA), the Apple team ID and whether the Apple ID is a free one.
+    var nxTarget: NXTarget = .macApp, teamID = "", freeAppleID = true
     private var home: URL { FileManager.default.homeDirectoryForCurrentUser }
 
-    enum CodingKeys: String, CodingKey { case selected, games, keys, firmware, language, projectDir, nxDir }
+    enum CodingKeys: String, CodingKey { case selected, games, keys, firmware, language, projectDir, nxDir, nxTarget, teamID, freeAppleID }
 
     init() {}
     /// Tolerant: a v1.1.0 file has no nxDir, and an unknown game id (a game removed from the catalog) is kept as it is.
@@ -192,7 +194,9 @@ struct LauncherSettings: Codable {
         games = (try? c.decodeIfPresent([String: GameSettings].self, forKey: .games)) ?? [:]
         func str(_ k: CodingKeys, _ d: String) -> String { (try? c.decodeIfPresent(String.self, forKey: k)) ?? d }
         keys = str(.keys, ""); firmware = str(.firmware, ""); language = str(.language, "zh-Hans")
-        projectDir = str(.projectDir, ""); nxDir = str(.nxDir, "")
+        projectDir = str(.projectDir, ""); nxDir = str(.nxDir, ""); teamID = str(.teamID, "")
+        nxTarget = (try? c.decodeIfPresent(NXTarget.self, forKey: .nxTarget)) ?? .macApp
+        freeAppleID = (try? c.decodeIfPresent(Bool.self, forKey: .freeAppleID)) ?? true
     }
 
     static func fresh(home: URL) -> LauncherSettings {
@@ -210,6 +214,7 @@ struct LauncherSettings: Codable {
             s.selected = read.selected; s.keys = read.keys; s.firmware = read.firmware; s.language = read.language
             if !read.projectDir.isEmpty { s.projectDir = read.projectDir }
             if !read.nxDir.isEmpty { s.nxDir = read.nxDir }
+            s.nxTarget = read.nxTarget; s.teamID = read.teamID; s.freeAppleID = read.freeAppleID
             for (k, v) in read.games { s.games[k] = v }
             return s
         }
@@ -702,11 +707,49 @@ func nxVenvCheckCommand(venv: String) -> String {
     "\(shQuote(venv + "/bin/python")) -c \"import lz4.block, capstone, fontTools, importlib.util as u; assert u.find_spec('nsz')\" >/dev/null 2>&1"
 }
 
-/// `scripts/build_ipa_from_nsp.py <stage> -k <keys> --platform mac-app -o <app> --progress json`, run in the nxnative folder.
-/// No language is passed: the build stops for a language the game lacks; the language is set at launch (DM_LANG in env.txt).
-func nxBuildCommand(venv: String, stage: String, keys: String, app: String) -> String {
-    "\(shQuote(venv + "/bin/python")) scripts/build_ipa_from_nsp.py \(shQuote(stage)) -k \(shQuote(keys)) --platform mac-app -o \(shQuote(app)) --progress json"
+/// What an nxnative build produces.
+enum NXTarget: String, Codable, CaseIterable {
+    case macApp, xcode, ipa
+    var label: String {
+        switch self {
+        case .macApp: return "Mac App"
+        case .xcode: return "iPad / iPhone（Xcode 工程，用自己的 Apple ID 签名）"
+        case .ipa: return "iPad / iPhone（IPA，用 Sideloadly / AltStore 签名安装）"
+        }
+    }
+    var isIOS: Bool { self != .macApp }
 }
+
+/// `scripts/build_ipa_from_nsp.py <stage> -k <keys> --platform mac-app -o <app> --progress json`, run in the nxnative folder.
+/// For iOS: `--prepare-xcode` (an Xcode project in a workspace next to the stage folder) or `--platform ios -o <ipa>`.
+/// `freeAppleID` drops the Increased Memory Limit entitlement (`DM_ENTITLEMENTS=` empty), which a free account cannot provision.
+/// No language is passed: the build stops for a language the game lacks; the language is set at launch (DM_LANG in env.txt).
+func nxBuildCommand(venv: String, stage: String, keys: String, app: String, target: NXTarget = .macApp, teamID: String = "", workspace: String = "", freeAppleID: Bool = true) -> String {
+    let base = "\(shQuote(venv + "/bin/python")) scripts/build_ipa_from_nsp.py \(shQuote(stage)) -k \(shQuote(keys))"
+    let team = teamID.isEmpty ? "" : " --team-id \(shQuote(teamID))"
+    switch target {
+    case .macApp:
+        return base + " --platform mac-app -o \(shQuote(app)) --progress json"
+    case .xcode:
+        let env = freeAppleID ? "DM_ENTITLEMENTS= " : ""
+        let ws = workspace.isEmpty ? "" : " --xcode-workspace \(shQuote(workspace))"
+        return env + base + " --prepare-xcode\(ws)\(team) --progress json"
+    case .ipa:
+        return base + " --platform ios -o \(shQuote(app))\(team) --progress json"
+    }
+}
+
+/// The IPA next to the Mac app's path: `~/Games/X/Game.app` -> `~/Games/X/Game.ipa`.
+func nxIPAPath(app: String) -> String {
+    (app as NSString).deletingPathExtension + ".ipa"
+}
+
+/// The Xcode workspace that collects the prepared games, next to the build folder.
+func nxWorkspacePath(stage: String) -> String {
+    ((stage as NSString).deletingLastPathComponent as NSString).appendingPathComponent("sw-launcher.xcworkspace")
+}
+
+let nxXcodeNextSteps = "Xcode 工程已生成并打开。接下来：1) Xcode > Settings > Apple Accounts 登录你的 Apple ID；2) 选 DmIOS 目标的 Signing & Capabilities，勾选自动签名并选你的 Personal Team，Bundle ID 冲突就换一个；3) 用线连接 iPad，开启开发者模式并信任；4) 选游戏的 scheme 点 Run。免费 Apple ID 的签名 7 天后过期，重新 Run 一次即可。"
 
 // MARK: - nxnative: build progress
 
