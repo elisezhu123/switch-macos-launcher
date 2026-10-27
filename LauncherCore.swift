@@ -182,9 +182,11 @@ struct LauncherSettings: Codable {
     var keys = "", firmware = "", language = "zh-Hans", projectDir = "", nxDir = ""
     /// nxnative only: what to build (Mac app, iPhone/iPad Xcode project, or IPA), the Apple team ID and whether the Apple ID is a free one.
     var nxTarget: NXTarget = .macApp, teamID = "", freeAppleID = true
+    /// nxnative Xcode target: the workspace path; empty = `nxWorkspacePath(stage:)`.
+    var nxWorkspace = ""
     private var home: URL { FileManager.default.homeDirectoryForCurrentUser }
 
-    enum CodingKeys: String, CodingKey { case selected, games, keys, firmware, language, projectDir, nxDir, nxTarget, teamID, freeAppleID }
+    enum CodingKeys: String, CodingKey { case selected, games, keys, firmware, language, projectDir, nxDir, nxTarget, teamID, freeAppleID, nxWorkspace }
 
     init() {}
     /// Tolerant: a v1.1.0 file has no nxDir, and an unknown game id (a game removed from the catalog) is kept as it is.
@@ -194,7 +196,7 @@ struct LauncherSettings: Codable {
         games = (try? c.decodeIfPresent([String: GameSettings].self, forKey: .games)) ?? [:]
         func str(_ k: CodingKeys, _ d: String) -> String { (try? c.decodeIfPresent(String.self, forKey: k)) ?? d }
         keys = str(.keys, ""); firmware = str(.firmware, ""); language = str(.language, "zh-Hans")
-        projectDir = str(.projectDir, ""); nxDir = str(.nxDir, ""); teamID = str(.teamID, "")
+        projectDir = str(.projectDir, ""); nxDir = str(.nxDir, ""); teamID = str(.teamID, ""); nxWorkspace = str(.nxWorkspace, "")
         nxTarget = (try? c.decodeIfPresent(NXTarget.self, forKey: .nxTarget)) ?? .macApp
         freeAppleID = (try? c.decodeIfPresent(Bool.self, forKey: .freeAppleID)) ?? true
     }
@@ -214,7 +216,7 @@ struct LauncherSettings: Codable {
             s.selected = read.selected; s.keys = read.keys; s.firmware = read.firmware; s.language = read.language
             if !read.projectDir.isEmpty { s.projectDir = read.projectDir }
             if !read.nxDir.isEmpty { s.nxDir = read.nxDir }
-            s.nxTarget = read.nxTarget; s.teamID = read.teamID; s.freeAppleID = read.freeAppleID
+            s.nxTarget = read.nxTarget; s.teamID = read.teamID; s.freeAppleID = read.freeAppleID; s.nxWorkspace = read.nxWorkspace
             for (k, v) in read.games { s.games[k] = v }
             return s
         }
