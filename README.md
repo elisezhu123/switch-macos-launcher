@@ -52,7 +52,7 @@
 - **多线程**：设置 → 图形里的“着色器预热线程数”写成 `DM_PSO_PREPARE_THREADS`（默认等于 CPU 核心数）。
 - **Mods**：沿用同一份 mods 列表（开关、顺序、冲突），启动时转成 nxnative 自带的 `DM_ROMFS_OVERLAY`：先读 mod 里的文件，没有的再读原版；不用重新构建。
 - **其他设置**（帧率 30/60、渲染比例、主机/掌机、MetalFX、手柄震动、Metal 4 管线等）按游戏保存，写进 `~/Library/Application Support/nxnative/<标题ID>/env.txt` 里启动器自己的那一段；你手写在段外的行优先。语言只在游戏支持时写入（读构建时解出的 `control.nacp`）。
-- **iPad / iPhone**（v1.3.0）：设置 → 高级 → “构建目标”可选 Xcode 工程（推荐）或 IPA。Xcode 工程：构建完自动打开，登录自己的 Apple ID（免费的也行）、选 Personal Team、连上 iPad 点 Run；免费账号签名 7 天过期，重新 Run 即可，且不能申请“增大内存限制”（大型游戏可能被系统关闭）。IPA：用 Sideloadly / AltStore 签名安装。iOS 构建需要 Xcode，**整条流程未在真机验证**。
+- **iPad / iPhone**（v1.2.0）：设置 → 高级 → “构建目标”可选 Xcode 工程（推荐）或 IPA。Xcode 工程：构建完自动打开，登录自己的 Apple ID（免费的也行）、选 Personal Team、连上 iPad 点 Run；免费账号签名 7 天过期，重新 Run 即可，且不能申请“增大内存限制”（大型游戏可能被系统关闭）。IPA：用 Sideloadly / AltStore 签名安装。iOS 构建需要 Xcode，**整条流程未在真机验证**。
 - **存档**在 `~/Library/Application Support/nxnative/<标题ID>/save`，日志在 `~/Library/Logs/nxnative/<标题ID>.log`。
 - **未验证**：整条 nxnative 构建流程（装依赖、30–60 分钟的首次构建、启动）没有在真机上完整跑过；命令生成、设置、env.txt、overlay、进度解析、运行检测有单元测试。遇到问题请先看日志。
 - nxnative 的游戏目录由 `scripts/gen-catalog.py` 从它的 `dm/games` 生成到 `NXCatalog.swift`。
@@ -149,7 +149,7 @@
 
 A Ryujinx-style macOS launcher for building and running **your own copy** of a game on **Apple silicon Macs**.
 
-> **Supports *The Legend of Zelda: Tears of the Kingdom* and, experimentally, *Breath of the Wild* (1.9.0).** Renamed to **sw-launcher** in v1.1.0; v1.0.x settings are migrated and an already built TOTK app keeps working.
+> **Two backends, 71 entries.** **MacNativeGames**: *The Legend of Zelda: Tears of the Kingdom* (1.0.0 / 1.1.2 / 1.4.3) and, experimentally, *Breath of the Wild* (1.9.0). **nxnative** ([seedds/nxnative](https://github.com/seedds/nxnative), added in v1.2.0): **69 games**, each at the versions its profile supports. Renamed to **sw-launcher** in v1.1.0; older settings are migrated and already built apps keep working.
 
 It is **derived from [MacNativeGames](https://github.com/ly05010419/MacNativeGames) (MIT) by [ly05010419](https://github.com/ly05010419)**, who did the real work of making the game run natively. Many thanks! This repository adds a native launcher plus a small patch for M1 / macOS 27.
 
@@ -162,6 +162,10 @@ It is **derived from [MacNativeGames](https://github.com/ly05010419/MacNativeGam
 **BOTW (experimental, `sw-port.patch`)**: needs the base NSP and the 1.9.0 update NSP. It builds and starts, showing the opening flash and the Shrine of Resurrection; lighting is incomplete, MetalFX and frame interpolation are not adapted yet, first start translates shaders on use. Some 1.9.0 update copies have one damaged 1 MiB region inside `Event_BGM_CompleteMasterSword.bfstm`; that case builds with a warning, any damage elsewhere stops the build and names the file.
 
 **Mods (RomFS)**: pick a mods folder in Settings → 存档与 Mods. Layouts `<mods>/<mod>/romfs/...` and Ryujinx's `<mods>/contents/<title ID>/<mod>/romfs/...`. Per-mod on/off and order (later wins, conflicts shown), applied at the next start without rebuilding. Only files the game already has can be replaced; new files are skipped and flagged. No ExeFS patches or cheats.
+
+**nxnative backend (v1.2.0)**: builds from the base game, the matching update (file name must carry `[v<version>]`), optional DLC and `prod.keys` — **no firmware needed**. The launcher runs nxnative's `build_ipa_from_nsp.py --progress json` and only symlinks your game files. Settings (shader pre-warm threads → `DM_PSO_PREPARE_THREADS`, fps, render scale, docked/handheld, MetalFX, language, …) are written per game into the launcher's own block of `~/Library/Application Support/nxnative/<title ID>/env.txt`; the same mods list is passed as `DM_ROMFS_OVERLAY`. The environment page installs Xcode tools, Metal Toolchain, Homebrew packages, .NET SDK 10 and nxnative, each only after you click Install.
+
+**iPad / iPhone (v1.2.0)**: Settings → 高级 → build target: **Xcode project** (recommended; opens when done — sign in with your Apple ID, free accounts work, pick your Personal Team, connect the iPad and Run), **IPA** (sign with Sideloadly / AltStore), or **Mac App**. Free accounts expire after 7 days and cannot get the Increased Memory Limit entitlement, so large games may be closed by iOS. **The full nxnative build (Mac and iOS) has not been run end to end on real hardware yet**; command generation, settings, env.txt, overlay and progress parsing are unit tested.
 
 **Not implemented / known issues**: On the test machine (M1 Max, macOS 27) the 1080p start mode and the MetalFX mode show a black window while the full 2560×1440 output works; the scene and the upscaled output are rendered correctly, the failure is in the last step that puts the picture on the window. The root cause was not found, v1.0.1 simply avoids those modes by default.
 
