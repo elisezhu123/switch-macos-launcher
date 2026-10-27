@@ -735,10 +735,13 @@ extension Model {
         let gs = s.current, nxDir = (s.nxDir as NSString).expandingTildeInPath
         let keys = (s.keys as NSString).expandingTildeInPath, app = (gs.outputApp as NSString).expandingTildeInPath
         let stage = (gs.workDir as NSString).expandingTildeInPath
+        let target = s.nxTarget, teamID = s.teamID.trimmingCharacters(in: .whitespaces), free = s.freeAppleID
+        let ipa = nxIPAPath(app: app), workspace = nxWorkspacePath(stage: stage)
+        let output = target == .ipa ? ipa : app
         let files = stageInputs(game: gs.game, update: gs.update, dlcFolder: gs.dlc)
         Task {
             do {
-                try FileManager.default.createDirectory(atPath: (app as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(atPath: (output as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
                 try stageGameFiles(stage: URL(fileURLWithPath: stage), files: files)
             } catch {
                 busy = nil; progress = nil; step = ""
@@ -747,17 +750,32 @@ extension Model {
             log += "构建文件夹：\(stage)\n" + files.map { "  \($0.lastPathComponent)\n" }.joined()
             let lines = LineBuffer()
             var totalStages = 0
-            let status = await runStreaming(nxBuildCommand(venv: Paths.nxVenv.path, stage: stage, keys: keys, app: app), cwd: nxDir, env: Model.nxToolEnvironment) { text in
+            let status = await runStreaming(nxBuildCommand(venv: Paths.nxVenv.path, stage: stage, keys: keys, app: output, target: target, teamID: teamID, workspace: workspace, freeAppleID: free), cwd: nxDir, env: Model.nxToolEnvironment) { text in
                 let whole = lines.feed(text)
                 Task { @MainActor in for l in whole { totalStages = self.handleNXBuildLine(l, total: totalStages) } }
             }
             await MainActor.run {
                 if let rest = lines.flush() { self.log += rest + "\n" }
                 self.busy = nil; self.progress = nil; self.step = ""
-                let built = FileManager.default.fileExists(atPath: app + "/Contents/MacOS/nxnative")
-                self.notice = status == 0 && built
-                    ? "构建完成，可以启动《\(self.s.selected.displayName)》了。第一次启动要预热着色器，会慢一些。"
-                    : "构建没有成功，请展开下面的日志查看原因。如果提示没有这个游戏或版本的档案，说明文件的版本不在支持列表里（\(info.displayVersions.joined(separator: "、"))）。"
+                let fm = FileManager.default
+                let built: Bool
+                switch target {
+                case .macApp: built = fm.fileExists(atPath: app + "/Contents/MacOS/nxnative")
+                case .xcode: built = fm.fileExists(atPath: workspace)
+                case .ipa: built = fm.fileExists(atPath: ipa)
+                }
+                let failed = "构建没有成功，请展开下面的日志查看原因。如果提示没有这个游戏或版本的档案，说明文件的版本不在支持列表里（\(info.displayVersions.joined(separator: "、"))）。"
+                guard status == 0 && built else { self.notice = failed; return }
+                switch target {
+                case .macApp:
+                    self.notice = "构建完成，可以启动《\(self.s.selected.displayName)》了。第一次启动要预热着色器，会慢一些。"
+                case .xcode:
+                    self.notice = nxXcodeNextSteps
+                    NSWorkspace.shared.open(URL(fileURLWithPath: workspace))
+                case .ipa:
+                    self.notice = "IPA 已生成：\(ipa)。用 Sideloadly 或 AltStore 登录自己的 Apple ID 签名安装到 iPad；免费 Apple ID 的签名 7 天后过期，需要重新安装。"
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: ipa)])
+                }
             }
         }
     }
@@ -1368,6 +1386,13 @@ struct SettingsView: View {
             DisclosureGroup("高级：输出位置", isExpanded: $advanced) {
                 VStack(alignment: .leading, spacing: 10) {
                     if g.backend == .nxnative {
+                        Picker("构建目标", selection: $model.s.nxTarget) {
+                            ForEach(NXTarget.allCases, id: \.self) { Text($0.label).tag($0) }
+                        }
+                        if model.s.nxTarget.isIOS {
+                            labeled("Apple Team ID（可留空，在 Xcode 里选）", $model.s.teamID)
+                            Toggle("免费 Apple ID（不申请“增大内存限制”，大型游戏可能被系统关闭）", isOn: $model.s.freeAppleID)
+                        }
                         labeled("nxnative 目录", $model.s.nxDir)
                         labeled("生成的 App", $model.s.outputApp)
                         labeled("构建文件夹（放游戏文件的链接和中间文件）", $model.s.workDir)

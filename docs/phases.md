@@ -25,3 +25,22 @@
 - [x] 能跑：`./build.sh` 成功，启动器能打开并显示游戏库。
 - [x] 测试通过：`./scripts/test.sh` 全部通过（目录、设置迁移、env.txt、overlay、运行检测、命令生成）。
 - [ ] 真机整条构建流程（需要 Homebrew 依赖、.NET 10、Metal Toolchain 和游戏文件，30–60 分钟）：**未在本阶段验证**。
+
+## phase/02-nxnative-ios
+
+**目标**：nxnative 后端除 Mac App 外，还能为 iPad / iPhone 构建，让用户用自己的 Apple ID 签名后装到设备上。
+
+**设计要点**
+
+- 构建目标三选一（设置 → 高级）：`Mac App`（原有）、`Xcode 工程`（`--prepare-xcode`，推荐）、`IPA`（`--platform ios`）。
+- 推荐 Xcode 工程：Xcode 登录免费 Apple ID 后可直接签名并用线安装到 iPad；IPA 要靠 Sideloadly / AltStore 重签，文件也大得多。
+- 免费 Apple ID 无法申请“增大内存限制”，所以默认用空的 `DM_ENTITLEMENTS=` 构建；代价是大型游戏可能被 iOS 关闭。付费账号取消勾选即可。
+- Team ID 可选，通过 `--team-id` 传给构建脚本；留空就在 Xcode 里选。
+- iOS 目标不改 Mac 的启动、env.txt、Mods 逻辑（这些只对 Mac App 生效）。
+
+**完成标准**
+
+- [x] 功能达标：目标选择、Team ID、免费账号开关、三种命令生成、完成后的提示（Xcode 工程自动打开，IPA 在访达中显示）。
+- [x] 能跑：`./build.sh` 成功。
+- [x] 测试通过：`./scripts/test.sh` 全部通过（新增 iOS 命令、路径、设置往返）。
+- [ ] 真机：整条 iOS 构建与在 iPad 上运行**未验证**（需要 Xcode、Apple ID、iPad 和游戏文件）。
