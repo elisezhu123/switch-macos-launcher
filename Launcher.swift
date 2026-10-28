@@ -198,6 +198,8 @@ final class Model: ObservableObject {
     /// Whether PyPI and GitHub answered quickly; probed once at start, before anything is installed automatically.
     @Published var officialFast = true
     @Published var netChecked = false
+    /// A newer copy of the launcher was installed over this one while it runs: macOS keeps running the old code until a restart.
+    @Published var replacedOnDisk = false
 
     static let initialTab: Int = {
         let a = CommandLine.arguments
@@ -211,7 +213,7 @@ final class Model: ObservableObject {
         }
         deps = Model.makeDeps(project: s.projectDir, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror, ios: s.nxTarget.isIOS)
         if !isDemoMode { refreshCatalog() }
-        if !isDemoMode && !isSnapshot { probeNetwork() }
+        if !isDemoMode && !isSnapshot { probeNetwork(); watchForNewVersion() }
         if !isDemoMode { preloadCovers() }   // a snapshot too: it only reads and downloads pictures
         if isDemoMode { demo() }
     }
@@ -247,6 +249,28 @@ final class Model: ObservableObject {
             if !hasProxy { return found + "，使用国内镜像（清华 TUNA、中科大、华为云、ghfast）" }
             return officialFast ? found + "，官方源速度正常，使用官方源" : found + "，但官方源响应慢，改用国内镜像"
         }
+    }
+
+    /// Checks every 20 s whether the app on disk is not the one that was started (its executable changed).
+    func watchForNewVersion() {
+        guard let exe = Bundle.main.executableURL else { return }
+        func stamp() -> Date? { (try? FileManager.default.attributesOfItem(atPath: exe.path))?[.modificationDate] as? Date }
+        let started = stamp()
+        Task {
+            while !replacedOnDisk {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                if let now = stamp(), let started, now > started { replacedOnDisk = true }
+            }
+        }
+    }
+
+    /// Opens the app again from disk (the new version) once this copy has quit.
+    func relaunch() {
+        let path = Bundle.main.bundlePath
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-c", "while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 0.3; done; /usr/bin/open \(shQuote(path))"]
+        try? p.run()
+        NSApp.terminate(nil)
     }
 
     func probeNetwork() {
@@ -1001,16 +1025,15 @@ extension Model {
                 return status
             }
             let started = Date()
-            var status = await run(allowDamaged: false)
-            // A damaged copy: run again past it only when all of the damage is the known, harmless kind; otherwise name the files.
-            let logs = URL(fileURLWithPath: stage).appendingPathComponent("\(info.id)_build/logs")
-            let damaged = status == 0 ? [] : nxDamagedFiles(logs: logs, since: started)
+            // A game with damage known to be harmless (Breath of the Wild 1.9.0) goes past it from the start; any other game stops on damage.
+            let tolerant = nxKnownDamage[info.id] != nil
+            let status = await run(allowDamaged: tolerant)
+            let damaged = nxDamagedFiles(logs: URL(fileURLWithPath: stage).appendingPathComponent("\(info.id)_build/logs"), since: started)
             var damageNote: String? = nil
-            if nxDamageIsKnown(damaged, titleID: info.id) {
-                log += "\n更新包有一处已知的损坏（\(damaged.joined(separator: "、"))），不影响游戏，带上 --allow-damaged 重新构建…\n"
-                step = "跳过已知的损坏，重新构建"
-                damageNote = "这份更新包里有一处已知的损坏，只在拔出大师之剑时的一段背景音乐里，已照常构建；那段音乐播放时可能有杂音。"
-                status = await run(allowDamaged: true)
+            if tolerant && !damaged.isEmpty {
+                damageNote = nxDamageIsKnown(damaged, titleID: info.id)
+                    ? "这份更新包里有一处已知的损坏（拔出大师之剑时的一段背景音乐），已照常构建；那段音乐播放时可能有杂音。"
+                    : "注意：有 \(damaged.count) 个文件没通过校验（\(damaged.prefix(3).joined(separator: "、"))\(damaged.count > 3 ? " 等" : "")），已照常构建，相关内容可能出错。"
             }
             await MainActor.run {
                 self.busy = nil; self.progress = nil; self.step = ""
@@ -1348,6 +1371,7 @@ struct MainView: View {
         VStack(spacing: 0) {
             toolbar
             Rectangle().fill(Theme.line).frame(height: 1)
+            if model.replacedOnDisk { updateBar }
             HStack(spacing: 0) {
                 sidebar.frame(width: 214)
                 Rectangle().fill(Theme.line).frame(width: 1)
@@ -1421,6 +1445,18 @@ struct MainView: View {
         }
         .padding(.leading, snapshot ? 14 : 84).padding(.trailing, 14).padding(.bottom, 6).padding(.top, snapshot ? 6 : 4)
         .background(Theme.panel)
+    }
+
+    var updateBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.triangle.2.circlepath.circle.fill").foregroundStyle(accent)
+            Text("新版本已经安装，正在运行的还是旧版。重开后才会生效。").font(.system(size: 12))
+            Spacer()
+            Button("立即重开") { model.relaunch() }.controlSize(.small).disabled(model.busy != nil || model.launching)
+                .help(model.busy != nil ? "正在构建，完成后再重开" : "退出并重新打开启动器")
+        }
+        .padding(.horizontal, 18).padding(.vertical, 7)
+        .background(accent.opacity(0.14))
     }
 
     // MARK: sidebar
