@@ -14,7 +14,7 @@
 > - **MacNativeGames**：《塞尔达传说 王国之泪》（1.0.0 / 1.1.2 / 1.4.3）和《旷野之息》（1.9.0，实验性）。保留原有的多线程着色器预热、预编译烘焙和 RomFS Mods。
 > - **nxnative**（[seedds/nxnative](https://github.com/seedds/nxnative)，见 [AppleGamingWiki 教程](https://www.applegamingwiki.com/wiki/Nxnative_Switch_to_Mac_conversion)）：**69 款游戏**，每款按它的档案支持对应版本，例如《超级马力欧兄弟 惊奇》1.0.0 / 1.0.1 / 1.2.1、《路易吉洋馆3》1.4.0、《火焰纹章 Engage》2.0.0、《怪物猎人 崛起》16.0.2。完整列表在启动器的游戏库里，装好 nxnative 后点“更新 nxnative 与游戏列表”还会自动读到它新增的游戏和版本。
 >
-> v1.2.0 加入 nxnative 后端；v1.4.0 重做主窗口（分类、游戏详情面板），缺少的组件自动后台安装，并换了新图标；v1.5.0 加入一键安装、国内镜像，详情面板里可直接管理存档和 Mods。旧版设置自动沿用，已经构建好的 App 不用重新构建。
+> v1.2.0 加入 nxnative 后端；v1.4.0 重做主窗口（分类、游戏详情面板），缺少的组件自动后台安装，并换了新图标；v1.5.0 加入一键安装、国内镜像，详情面板里可直接管理存档和 Mods；v1.6.0 游戏库显示游戏封面，设置精简为四页。旧版设置自动沿用，已经构建好的 App 不用重新构建。
 
 ### 重要声明（请务必阅读）
 
@@ -158,7 +158,7 @@ It is **derived from [MacNativeGames](https://github.com/ly05010419/MacNativeGam
 
 > **No game content is included.** The game file (XCI/NSP), `prod.keys` and firmware must be obtained **by you, from your own Switch**. **Do not distribute or sell** them or any app built from them — **personal use only.** Not affiliated with Nintendo.
 
-**Features**: game-library window, redesigned in v1.4.0 (sidebar categories by status and backend, a detail pane to pick the version, add files by clicking, choose Mac / iPad·iPhone / IPA and build or start; drag & drop `.xci`/`.nsp` still works), background auto-install of missing requirements that need no password (on by default), one-click install of everything missing (one Terminal window, one password; v1.5.0), China mirrors when there is no proxy or the official sources are slow (TUNA, USTC, ghfast; v1.5.0), saves and mods in the detail pane (v1.5.0), system detection (macOS 26+, Metal 4, M-series, RAM), environment check with background installers (including the 839 MB Metal Toolchain), 12 game languages (Simplified Chinese by default), save import with automatic backup, build progress, and automatic retry when the game fails to reserve its address space.
+**Features**: game-library window, redesigned in v1.4.0 (sidebar categories by status and backend, a detail pane to pick the version, add files by clicking, choose Mac / iPad·iPhone / IPA and build or start; drag & drop `.xci`/`.nsp` still works), background auto-install of missing requirements that need no password (on by default), one-click install of everything missing (one Terminal window, one password; v1.5.0), China mirrors when there is no proxy or the official sources are slow (TUNA, USTC, ghfast; v1.5.0), saves and mods in the detail pane (v1.5.0), game covers in the library (the icon from your own game file, or the eShop icon fetched from Nintendo at run time and cached; v1.6.0), a four-page settings window (v1.6.0), system detection (macOS 26+, Metal 4, M-series, RAM), environment check with background installers (including the 839 MB Metal Toolchain), 12 game languages (Simplified Chinese by default), save import with automatic backup, build progress, and automatic retry when the game fails to reserve its address space.
 
 **Patch (`totk-mac-fixes.patch`, 5 files, against upstream commit `41e1e0c`)**: multi-threaded shader pre-warming (6 threads by default, `TOTK_WARM_THREADS`), a persistent precompiled shader cache (`.metallib` files that other Metal apps cannot evict), a memory-layout fallback for Macs where the default fixed addresses cannot be reserved, a `language.txt` setting, and (v1.0.1) **starting in native 2560×1440 by default** (`TOTK_OUTPUT_RES=auto` restores the upstream 1080p start).
 
