@@ -793,21 +793,28 @@ func systemProxyEnvironment(scutil: String) -> [String: String] {
 }
 
 /// Everything an installer or build gets: the proxy, the mirrors when they are used, and pip timeouts so a stalled download fails
-/// with a message instead of hanging.
-func networkEnvironment(mirror: Bool, proxy: [String: String]) -> [String: String] {
+/// with a message instead of hanging. `nugetMirror`: api.nuget.org drops TLS connections now and then even behind a proxy (a
+/// startup probe cannot see that), and one failed request fails the whole nx_extract build, so the NuGet mirror is used unless
+/// the player chose the official sources.
+func networkEnvironment(mirror: Bool, proxy: [String: String], nugetMirror: Bool = false) -> [String: String] {
     proxy.merging(mirrorEnvironment(mirror)) { $1 }.merging(["PIP_DEFAULT_TIMEOUT": "60", "PIP_RETRIES": "5"]) { $1 }
+        .merging(mirror || nugetMirror ? ["RestoreSources": Mirrors.nuget] : [:]) { $1 }
 }
 
-/// `curl` exit status 0 when PyPI and GitHub both answer within 4 s (through `proxy`).
+/// `curl` exit status 0 when PyPI, GitHub and NuGet all answer within 4 s (through the proxy in the environment).
 func officialSourcesProbe() -> String {
-    "curl -sfI -o /dev/null -m 4 https://pypi.org/simple/pip/ && curl -sfI -o /dev/null -m 4 https://github.com/"
+    ["https://pypi.org/simple/pip/", "https://github.com/", "https://api.nuget.org/v3/index.json"]
+        .map { "curl -sfI -o /dev/null -m 4 \($0)" }.joined(separator: " && ")
 }
 
-/// Homebrew and PyPI: TUNA (Tsinghua); the Homebrew installer: USTC's copy of the official script; git clones: a GitHub proxy.
+/// Homebrew and PyPI: TUNA (Tsinghua); the Homebrew installer: USTC's copy of the official script; git clones: a GitHub proxy;
+/// NuGet (the packages of nxnative's nx_extract): Huawei Cloud, passed as the MSBuild property RestoreSources (MSBuild reads
+/// environment variables as properties), so the player's own NuGet configuration is not touched.
 enum Mirrors {
     static let pypi = "https://pypi.tuna.tsinghua.edu.cn/simple"
     static let github = "https://ghfast.top/"
     static let brewInstaller = "https://mirrors.ustc.edu.cn/misc/brew-install.sh"
+    static let nuget = "https://repo.huaweicloud.com/repository/nuget/v3/index.json"
     static let environment: [String: String] = [
         "HOMEBREW_API_DOMAIN": "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api",
         "HOMEBREW_BOTTLE_DOMAIN": "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles",
@@ -871,8 +878,10 @@ enum NXTarget: String, Codable, CaseIterable {
 /// For iOS: `--prepare-xcode` (an Xcode project in a workspace next to the stage folder) or `--platform ios -o <ipa>`.
 /// `freeAppleID` drops the Increased Memory Limit entitlement (`DM_ENTITLEMENTS=` empty), which a free account cannot provision.
 /// No language is passed: the build stops for a language the game lacks; the language is set at launch (DM_LANG in env.txt).
-func nxBuildCommand(venv: String, stage: String, keys: String, app: String, target: NXTarget = .macApp, teamID: String = "", workspace: String = "", freeAppleID: Bool = true) -> String {
-    let base = "\(shQuote(venv + "/bin/python")) scripts/build_ipa_from_nsp.py \(shQuote(stage)) -k \(shQuote(keys))"
+/// `allowDamaged`: go on past files that fail the NCA hash check (only for damage known to be harmless, nxDamageIsKnown).
+func nxBuildCommand(venv: String, stage: String, keys: String, app: String, target: NXTarget = .macApp, teamID: String = "", workspace: String = "",
+                    freeAppleID: Bool = true, allowDamaged: Bool = false) -> String {
+    let base = "\(shQuote(venv + "/bin/python")) scripts/build_ipa_from_nsp.py \(shQuote(stage)) -k \(shQuote(keys))" + (allowDamaged ? " --allow-damaged" : "")
     let team = teamID.isEmpty ? "" : " --team-id \(shQuote(teamID))"
     switch target {
     case .macApp:
@@ -884,6 +893,32 @@ func nxBuildCommand(venv: String, stage: String, keys: String, app: String, targ
     case .ipa:
         return base + " --platform ios -o \(shQuote(app))\(team) --progress json"
     }
+}
+
+// MARK: - nxnative: damaged game files
+
+/// Damage known to be harmless: some copies of Breath of the Wild's 1.9.0 update have one damaged 1 MiB region, always inside this
+/// music track (the same case the MacNativeGames build lets through with a warning).
+let nxKnownDamage: [String: Set<String>] = ["01007EF00011E000": ["/Sound/Resource/Stream/Event_BGM_CompleteMasterSword.bfstm"]]
+
+/// The files nx_extract reported failing the hash check, from the logs of a build folder (`<stage>/<title ID>_build/logs`) written
+/// since `since` (older logs belong to earlier builds).
+func nxDamagedFiles(logs: URL, since: Date = .distantPast) -> [String] {
+    let fm = FileManager.default
+    var out = Set<String>()
+    for f in (try? fm.contentsOfDirectory(at: logs, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] where f.pathExtension == "log" {
+        guard ((try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) >= since,
+              let text = try? String(contentsOf: f, encoding: .utf8) else { continue }
+        for line in text.split(separator: "\n") {
+            if let r = line.range(of: "hash check failed: ") { out.insert(String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)) }
+        }
+    }
+    return out.sorted()
+}
+
+/// A build that stopped on damaged files may run again with --allow-damaged only when every damaged file is known to be harmless.
+func nxDamageIsKnown(_ files: [String], titleID: String) -> Bool {
+    !files.isEmpty && files.allSatisfy { nxKnownDamage[titleID]?.contains($0) == true }
 }
 
 /// The IPA next to the Mac app's path: `~/Games/X/Game.app` -> `~/Games/X/Game.ipa`.

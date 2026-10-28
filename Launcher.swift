@@ -171,8 +171,9 @@ final class Model: ObservableObject {
         didSet {
             if !isDemoMode { s.write(to: Paths.config) }
             if s.selected.backend != oldValue.selected.backend { refreshDeps() }   // each backend has its own list of requirements
+            if s.nxTarget != oldValue.nxTarget { refreshDeps() }   // an iPad / iPhone target also needs xcodegen
             if s.network != oldValue.network { Model.autoTried.removeAll(); refreshDeps() }   // other download sources: worth another try
-            if s.showCovers != oldValue.showCovers { coverRequested.removeAll(); if !s.showCovers { covers = [:] } }
+            if s.showCovers != oldValue.showCovers { coverRequested.removeAll(); covers = [:]; if s.showCovers { preloadCovers() } }
         }
     }
     /// Folders of the selected game.
@@ -197,6 +198,8 @@ final class Model: ObservableObject {
     /// Whether PyPI and GitHub answered quickly; probed once at start, before anything is installed automatically.
     @Published var officialFast = true
     @Published var netChecked = false
+    /// A newer copy of the launcher was installed over this one while it runs: macOS keeps running the old code until a restart.
+    @Published var replacedOnDisk = false
 
     static let initialTab: Int = {
         let a = CommandLine.arguments
@@ -208,9 +211,10 @@ final class Model: ObservableObject {
             let own = ProcessInfo.processInfo.environment.filter { ["http_proxy", "https_proxy", "all_proxy", "no_proxy"].contains($0.key.lowercased()) }
             proxyEnv = systemProxyEnvironment(scutil: sh("/usr/sbin/scutil --proxy").out).merging(own) { $1 }
         }
-        deps = Model.makeDeps(project: s.projectDir, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror)
+        deps = Model.makeDeps(project: s.projectDir, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror, ios: s.nxTarget.isIOS)
         if !isDemoMode { refreshCatalog() }
-        if !isDemoMode && !isSnapshot { probeNetwork() }
+        if !isDemoMode && !isSnapshot { probeNetwork(); watchForNewVersion() }
+        if !isDemoMode { preloadCovers() }   // a snapshot too: it only reads and downloads pictures
         if isDemoMode { demo() }
     }
 
@@ -233,18 +237,40 @@ final class Model: ObservableObject {
 
     var hasProxy: Bool { proxyEnv.keys.contains { $0.lowercased() != "no_proxy" } }
     var mirror: Bool { useMirrors(s.network, proxy: hasProxy, officialFast: officialFast) }
-    var netEnv: [String: String] { networkEnvironment(mirror: mirror, proxy: proxyEnv) }
+    var netEnv: [String: String] { networkEnvironment(mirror: mirror, proxy: proxyEnv, nugetMirror: s.network != .direct) }
     var netSummary: String {
         let proxy = proxyEnv["https_proxy"] ?? proxyEnv["http_proxy"] ?? proxyEnv["all_proxy"]
         let found = proxy.map { "检测到代理 \($0.replacingOccurrences(of: "http://", with: ""))" } ?? "没有检测到代理"
         switch s.network {
         case .direct: return found + "；按设置使用官方源"
-        case .mirror: return found + "；按设置使用国内镜像（清华 TUNA、中科大、ghfast）"
+        case .mirror: return found + "；按设置使用国内镜像（清华 TUNA、中科大、华为云、ghfast）"
         case .auto:
             if !netChecked { return found + "；正在测试官方源速度…" }
-            if !hasProxy { return found + "，使用国内镜像（清华 TUNA、中科大、ghfast）" }
+            if !hasProxy { return found + "，使用国内镜像（清华 TUNA、中科大、华为云、ghfast）" }
             return officialFast ? found + "，官方源速度正常，使用官方源" : found + "，但官方源响应慢，改用国内镜像"
         }
+    }
+
+    /// Checks every 20 s whether the app on disk is not the one that was started (its executable changed).
+    func watchForNewVersion() {
+        guard let exe = Bundle.main.executableURL else { return }
+        func stamp() -> Date? { (try? FileManager.default.attributesOfItem(atPath: exe.path))?[.modificationDate] as? Date }
+        let started = stamp()
+        Task {
+            while !replacedOnDisk {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                if let now = stamp(), let started, now > started { replacedOnDisk = true }
+            }
+        }
+    }
+
+    /// Opens the app again from disk (the new version) once this copy has quit.
+    func relaunch() {
+        let path = Bundle.main.bundlePath
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-c", "while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 0.3; done; /usr/bin/open \(shQuote(path))"]
+        try? p.run()
+        NSApp.terminate(nil)
     }
 
     func probeNetwork() {
@@ -255,7 +281,8 @@ final class Model: ObservableObject {
         }
     }
 
-    static func makeDeps(project: String, nxDir: String, backend: Backend, mirror: Bool = false) -> [Dep] {
+    /// `ios`: an nxnative iPad / iPhone target (Xcode project or IPA), which also needs xcodegen.
+    static func makeDeps(project: String, nxDir: String, backend: Backend, mirror: Bool = false, ios: Bool = false) -> [Dep] {
         let clt = Dep(id: "clt", title: "Xcode 命令行工具", detail: "编译游戏运行时所需", size: "约 1 GB", required: true, install: .terminal("xcode-select --install"))
         let brew = Dep(id: "brew", title: "Homebrew", detail: backend == .macnative ? "安装 Python 和音视频库" : "安装 Python、.NET 和构建工具", size: nil, required: true,
                        install: .terminal(brewInstallCommand(mirror: mirror)))
@@ -283,6 +310,8 @@ final class Model: ObservableObject {
                 metal,
                 Dep(id: "nxtools", title: "构建工具（git、zstd、spirv-cross、lz4、glslang）", detail: "解包、着色器翻译", size: "约 50 MB", required: true,
                     install: .background("/opt/homebrew/bin/brew install git zstd spirv-cross lz4 glslang")),
+                Dep(id: "xcodegen", title: "xcodegen", detail: ios ? "生成 iPad / iPhone 的 Xcode 工程" : "只有构建 iPad / iPhone（Xcode 工程或 IPA）时需要", size: "约 10 MB",
+                    required: ios, install: .background("/opt/homebrew/bin/brew install xcodegen")),
                 Dep(id: "dotnet", title: ".NET SDK 10", detail: "读取游戏文件（nx_extract）；安装包需要你输入密码，会在“终端”里运行", size: "约 400 MB", required: true,
                     install: .terminal("/opt/homebrew/bin/brew install --cask dotnet-sdk")),
                 Dep(id: "nxvenv", title: "Python 组件（capstone、fonttools、lz4、nsz）", detail: "装进启动器自己的环境，不改动系统 Python", size: "约 30 MB", required: true,
@@ -301,7 +330,7 @@ final class Model: ObservableObject {
         let inFlight = Dictionary(uniqueKeysWithValues: deps.compactMap { d -> (String, Dep.State)? in
             if case .installing = d.state { return (d.id, d.state) }; return nil
         })
-        deps = Model.makeDeps(project: project, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror)
+        deps = Model.makeDeps(project: project, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror, ios: s.nxTarget.isIOS)
         for i in deps.indices { if let st = inFlight[deps[i].id] { deps[i].state = st } }
         let ids = deps.map(\.id)
         Task.detached {
@@ -323,6 +352,7 @@ final class Model: ObservableObject {
                 case "nxvenv": results[id] = sh(nxVenvCheckCommand(venv: venv)).status == 0
                 case "nxrepo": results[id] = FileManager.default.fileExists(atPath: nxDir + "/scripts/build_ipa_from_nsp.py")
                 case "metal": results[id] = sh("xcrun -sdk macosx metal --version >/dev/null 2>&1").status == 0
+                case "xcodegen": results[id] = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/xcodegen")
                 case "disk":
                     let v = try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
                     results[id] = (v?.volumeAvailableCapacityForImportantUsage ?? 0) > Int64(needGB) * 1_000_000_000
@@ -342,7 +372,7 @@ final class Model: ObservableObject {
 
     /// What a background installer needs installed first (Homebrew for its packages, Python for the environments, Xcode for the Metal Toolchain).
     static let prerequisites: [String: [String]] = [
-        "python": ["brew"], "libs": ["brew"], "nxtools": ["brew"], "project": ["python", "clt"], "patch": ["project"],
+        "python": ["brew"], "libs": ["brew"], "nxtools": ["brew"], "xcodegen": ["brew"], "project": ["python", "clt"], "patch": ["project"],
         "nxvenv": ["python"], "nxrepo": ["clt"], "metal": ["xcode"],
     ]
     /// Requirements the auto-installer already started once this session: a failure is shown, not retried in a loop.
@@ -786,23 +816,65 @@ extension Model {
     /// The game's picture: the built app's icon, else the icon nxnative extracted from the player's own file or the eShop icon.
     func cover(_ g: GameKind) -> NSImage? { appIcon(g) ?? covers[g.titleID] }
 
-    /// Loads the game's picture once: the extracted icon, else the cached eShop icon, else downloads it (256 px) into the cache.
-    func requestCover(_ g: GameKind) {
+    /// Where one game's picture can come from.
+    struct CoverJob {
+        let id: String
+        let work: URL, cached: URL
+        let remote: URL?   // nil when covers are off: only the icon extracted from the player's own file
+    }
+
+    /// Takes the game for loading (once per session); nil when it has a picture already or is being loaded.
+    func coverJob(_ g: GameKind) -> CoverJob? {
         let id = g.titleID
-        guard !isDemoMode, covers[id] == nil, !coverRequested.contains(id), appIcon(g) == nil else { return }
+        guard !isDemoMode, covers[id] == nil, !coverRequested.contains(id), appIcon(g) == nil else { return nil }
         coverRequested.insert(id)
-        let work = URL(fileURLWithPath: (s.settings(for: g).workDir as NSString).expandingTildeInPath)
-        let cached = Paths.covers.appendingPathComponent(id + ".jpg")
-        let remote = s.showCovers ? coverURLs[id].flatMap(URL.init(string:)) : nil
+        return CoverJob(id: id, work: URL(fileURLWithPath: (s.settings(for: g).workDir as NSString).expandingTildeInPath),
+                        cached: Paths.covers.appendingPathComponent(id + ".jpg"),
+                        remote: s.showCovers ? coverURLs[id].flatMap(URL.init(string:)) : nil)
+    }
+
+    /// The extracted icon, else the cached eShop icon: no network.
+    nonisolated static func localCover(_ j: CoverJob) -> NSImage? {
+        extractedIcon(workDir: j.work, titleID: j.id).flatMap(NSImage.init(contentsOf:)) ?? (j.remote == nil ? nil : NSImage(contentsOf: j.cached))
+    }
+
+    /// The eShop icon (about 1 MB, 1024 px: the CDN has no smaller size), kept as a 256 px JPEG in the cache.
+    nonisolated static func downloadCover(_ j: CoverJob) async -> NSImage? {
+        guard let remote = j.remote, let r = try? await URLSession.shared.data(from: remote), (r.1 as? HTTPURLResponse)?.statusCode == 200,
+              let small = thumbnailJPEG(r.0, side: 256), let img = NSImage(data: small) else { return nil }
+        try? FileManager.default.createDirectory(at: Paths.covers, withIntermediateDirectories: true)
+        try? small.write(to: j.cached, options: .atomic)
+        return img
+    }
+
+    /// One game, when its row appears (a game the preload has not reached yet, or one added since).
+    func requestCover(_ g: GameKind) {
+        guard let job = coverJob(g) else { return }
         Task.detached {
-            let local = extractedIcon(workDir: work, titleID: id).flatMap(NSImage.init(contentsOf:))
-                ?? (remote == nil ? nil : NSImage(contentsOf: cached))
-            if let local { await MainActor.run { self.covers[id] = local }; return }
-            guard let remote, let r = try? await URLSession.shared.data(from: remote), (r.1 as? HTTPURLResponse)?.statusCode == 200,
-                  let small = thumbnailJPEG(r.0, side: 256), let img = NSImage(data: small) else { return }
-            try? FileManager.default.createDirectory(at: Paths.covers, withIntermediateDirectories: true)
-            try? small.write(to: cached, options: .atomic)
-            await MainActor.run { self.covers[id] = img }
+            var img = Model.localCover(job)
+            if img == nil { img = await Model.downloadCover(job) }
+            if let img { await MainActor.run { self.covers[job.id] = img } }
+        }
+    }
+
+    /// Every game at start: what is on disk shows at once, then the missing ones download 8 at a time instead of one row at a time.
+    func preloadCovers() {
+        let jobs = GameKind.all.compactMap(coverJob)
+        guard !jobs.isEmpty else { return }
+        Task.detached {
+            var found: [String: NSImage] = [:], missing: [CoverJob] = []
+            for j in jobs { if let img = Model.localCover(j) { found[j.id] = img } else if j.remote != nil { missing.append(j) } }
+            let local = found
+            await MainActor.run { self.covers.merge(local) { $1 } }
+            await withTaskGroup(of: (String, NSImage?).self) { group in
+                var queue = missing[...]
+                func start() { if let j = queue.popFirst() { group.addTask { (j.id, await Model.downloadCover(j)) } } }
+                for _ in 0..<8 { start() }
+                for await (id, img) in group {
+                    if let img { await MainActor.run { self.covers[id] = img } }
+                    start()
+                }
+            }
         }
     }
 
@@ -940,14 +1012,30 @@ extension Model {
                 notice = "无法准备构建文件夹：\(error.localizedDescription)"; return
             }
             log += "构建文件夹：\(stage)\n" + files.map { "  \($0.lastPathComponent)\n" }.joined()
-            let lines = LineBuffer()
-            var totalStages = 0
-            let status = await runStreaming(nxBuildCommand(venv: Paths.nxVenv.path, stage: stage, keys: keys, app: output, target: target, teamID: teamID, workspace: workspace, freeAppleID: free), cwd: nxDir, env: netEnv.merging(Model.nxToolEnvironment) { $1 }) { text in
-                let whole = lines.feed(text)
-                Task { @MainActor in for l in whole { totalStages = self.handleNXBuildLine(l, total: totalStages) } }
+            let env = netEnv.merging(Model.nxToolEnvironment) { $1 }
+            func run(allowDamaged: Bool) async -> Int32 {
+                let lines = LineBuffer()
+                var totalStages = 0
+                let status = await runStreaming(nxBuildCommand(venv: Paths.nxVenv.path, stage: stage, keys: keys, app: output, target: target, teamID: teamID,
+                                                               workspace: workspace, freeAppleID: free, allowDamaged: allowDamaged), cwd: nxDir, env: env) { text in
+                    let whole = lines.feed(text)
+                    Task { @MainActor in for l in whole { totalStages = self.handleNXBuildLine(l, total: totalStages) } }
+                }
+                if let rest = lines.flush() { await MainActor.run { self.log += rest + "\n" } }
+                return status
+            }
+            let started = Date()
+            // A game with damage known to be harmless (Breath of the Wild 1.9.0) goes past it from the start; any other game stops on damage.
+            let tolerant = nxKnownDamage[info.id] != nil
+            let status = await run(allowDamaged: tolerant)
+            let damaged = nxDamagedFiles(logs: URL(fileURLWithPath: stage).appendingPathComponent("\(info.id)_build/logs"), since: started)
+            var damageNote: String? = nil
+            if tolerant && !damaged.isEmpty {
+                damageNote = nxDamageIsKnown(damaged, titleID: info.id)
+                    ? "这份更新包里有一处已知的损坏（拔出大师之剑时的一段背景音乐），已照常构建；那段音乐播放时可能有杂音。"
+                    : "注意：有 \(damaged.count) 个文件没通过校验（\(damaged.prefix(3).joined(separator: "、"))\(damaged.count > 3 ? " 等" : "")），已照常构建，相关内容可能出错。"
             }
             await MainActor.run {
-                if let rest = lines.flush() { self.log += rest + "\n" }
                 self.busy = nil; self.progress = nil; self.step = ""
                 let fm = FileManager.default
                 let built: Bool
@@ -956,13 +1044,15 @@ extension Model {
                 case .xcode: built = fm.fileExists(atPath: workspace)
                 case .ipa: built = fm.fileExists(atPath: ipa)
                 }
-                let failed = "构建没有成功，请展开下面的日志查看原因。如果提示没有这个游戏或版本的档案，说明文件的版本不在支持列表里（\(info.displayVersions.joined(separator: "、"))）。"
+                let failed = !damaged.isEmpty && damageNote == nil
+                    ? "游戏文件损坏（\(damaged.count) 个文件没通过校验：\(damaged.prefix(3).joined(separator: "、"))\(damaged.count > 3 ? " 等" : "")），请从你的 Switch 重新导出这份文件。"
+                    : "构建没有成功，请展开下面的日志查看原因。如果提示没有这个游戏或版本的档案，说明文件的版本不在支持列表里（\(info.displayVersions.joined(separator: "、"))）。"
                 guard status == 0 && built else { self.notice = failed; return }
                 switch target {
                 case .macApp:
-                    self.notice = "构建完成，可以启动《\(self.s.selected.displayName)》了。第一次启动要预热着色器，会慢一些。"
+                    self.notice = (damageNote.map { $0 + " " } ?? "") + "构建完成，可以启动《\(self.s.selected.displayName)》了。第一次启动要预热着色器，会慢一些。"
                 case .xcode:
-                    self.notice = nxXcodeNextSteps
+                    self.notice = (damageNote.map { $0 + " " } ?? "") + nxXcodeNextSteps
                     NSWorkspace.shared.open(URL(fileURLWithPath: workspace))
                 case .ipa:
                     self.notice = "IPA 已生成：\(ipa)。用 Sideloadly 或 AltStore 登录自己的 Apple ID 签名安装到 iPad；免费 Apple ID 的签名 7 天后过期，需要重新安装。"
@@ -1066,41 +1156,6 @@ struct TagView: View {
         Text(text).font(.system(size: 10, weight: .semibold)).foregroundStyle(color)
             .padding(.horizontal, 7).padding(.vertical, 2)
             .background(color.opacity(0.15), in: Capsule())
-    }
-}
-
-struct Chip: View {
-    let text: String, ok: Bool?
-    var body: some View {
-        HStack(spacing: 4) {
-            if let ok { Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill").foregroundStyle(ok ? accent : .red) }
-            Text(text)
-        }
-        .font(.system(size: 12, weight: .medium))
-        .padding(.horizontal, 9).padding(.vertical, 4)
-        .background(Color.primary.opacity(0.07), in: Capsule())
-    }
-}
-
-struct PathRow: View {
-    let title: String
-    let tag: TagView.Kind
-    @Binding var value: String
-    let check: Check
-    let pickAction: () -> Void
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) { Text(title).font(.system(size: 13, weight: .medium)); TagView(kind: tag) }
-            HStack(spacing: 8) {
-                TextField("选择…", text: $value).textFieldStyle(.roundedBorder).font(.system(size: 12))
-                Button("选择…", action: pickAction)
-            }
-            switch check {
-            case .empty: EmptyView()
-            case .ok(let t): Label(t, systemImage: "checkmark.circle.fill").font(.system(size: 11)).foregroundStyle(accent)
-            case .bad(let t): Label(t, systemImage: "exclamationmark.triangle.fill").font(.system(size: 11)).foregroundStyle(.red)
-            }
-        }
     }
 }
 
@@ -1316,6 +1371,7 @@ struct MainView: View {
         VStack(spacing: 0) {
             toolbar
             Rectangle().fill(Theme.line).frame(height: 1)
+            if model.replacedOnDisk { updateBar }
             HStack(spacing: 0) {
                 sidebar.frame(width: 214)
                 Rectangle().fill(Theme.line).frame(width: 1)
@@ -1389,6 +1445,18 @@ struct MainView: View {
         }
         .padding(.leading, snapshot ? 14 : 84).padding(.trailing, 14).padding(.bottom, 6).padding(.top, snapshot ? 6 : 4)
         .background(Theme.panel)
+    }
+
+    var updateBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.triangle.2.circlepath.circle.fill").foregroundStyle(accent)
+            Text("新版本已经安装，正在运行的还是旧版。重开后才会生效。").font(.system(size: 12))
+            Spacer()
+            Button("立即重开") { model.relaunch() }.controlSize(.small).disabled(model.busy != nil || model.launching)
+                .help(model.busy != nil ? "正在构建，完成后再重开" : "退出并重新打开启动器")
+        }
+        .padding(.horizontal, 18).padding(.vertical, 7)
+        .background(accent.opacity(0.14))
     }
 
     // MARK: sidebar
@@ -1936,16 +2004,14 @@ struct NXSettingRow: View {
 struct SettingsView: View {
     @ObservedObject var model: Model
     @State var tab = Model.initialTab
-    @State private var advanced = false
 
     var body: some View {
         TabView(selection: $tab) {
-            filesTab.tabItem { Label("游戏文件", systemImage: "folder") }.tag(0)
-            systemTab.tabItem { Label("系统", systemImage: "cpu") }.tag(1)
-            graphicsTab.tabItem { Label("图形", systemImage: "display") }.tag(2)
-            envTab.tabItem { Label("环境", systemImage: "wrench.and.screwdriver") }.tag(3)
-            extrasTab.tabItem { Label("存档与 Mods", systemImage: "tray.and.arrow.down") }.tag(4)
-            aboutTab.tabItem { Label("关于", systemImage: "info.circle") }.tag(5)
+            // Game files, version, build target, saves and mods are in the main window's detail pane.
+            generalTab.tabItem { Label("通用", systemImage: "gearshape") }.tag(0)
+            graphicsTab.tabItem { Label("游戏", systemImage: "gamecontroller") }.tag(1)
+            envTab.tabItem { Label("环境", systemImage: "wrench.and.screwdriver") }.tag(2)
+            advancedTab.tabItem { Label("高级", systemImage: "folder.badge.gearshape") }.tag(3)
         }
         .frame(width: 640, height: 470)
         .background(Theme.bg)
@@ -1956,7 +2022,7 @@ struct SettingsView: View {
         ScrollView { VStack(alignment: .leading, spacing: 16) { c() }.padding(22).frame(maxWidth: .infinity, alignment: .leading) }
     }
 
-    /// Which game the per-game fields (game file, update, save, mods, output) belong to.
+    /// Which game the per-game settings (graphics, output paths) belong to.
     var gamePicker: some View {
         Picker("游戏", selection: $model.s.selected) {
             Section("MacNativeGames") {
@@ -1968,82 +2034,24 @@ struct SettingsView: View {
         }.pickerStyle(.menu).disabled(model.busy != nil)
     }
 
-    /// The versions the selected game can be built from, and which one is packed.
-    var versionsBlock: some View {
-        let g = model.s.selected
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) { Text("支持的版本").font(.system(size: 13, weight: .medium)); Text(g.titleID).font(.system(size: 11)).foregroundStyle(.secondary) }
-            HStack(spacing: 6) { ForEach(g.supportedVersions, id: \.self) { Chip(text: $0, ok: nil) } }
-            Text(g.nxInfo.map { "游戏本体加上对应版本的更新包；默认打包最新的 \($0.packageDisplay)。其他版本会被 nxnative 当成未收录的游戏。" }
-                 ?? (g == .botw ? "需要基础版和 1.9.0 更新。" : "基础版是 1.0.0；要玩 1.1.2 或 1.4.3，再选对应的累积更新包。"))
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-        }
-    }
-
-    var filesTab: some View {
+    /// Where things go: rarely changed, so they are kept out of the main window.
+    var advancedTab: some View {
         let g = model.s.selected
         return pane {
+            Text("构建工具").font(.system(size: 13, weight: .semibold))
+            labeled("MacNativeGames 构建工具目录", $model.s.projectDir) { model.pick(directory: true, title: "选择 MacNativeGames 目录") }
+            labeled("nxnative 目录", $model.s.nxDir) { model.pick(directory: true, title: "选择 nxnative 目录") }
+            Divider()
             gamePicker
-            versionsBlock
-            if g.backend == .nxnative { nxFiles } else { macFiles }
-            DisclosureGroup("高级：输出位置", isExpanded: $advanced) {
-                VStack(alignment: .leading, spacing: 10) {
-                    if g.backend == .nxnative {
-                        Picker("构建目标", selection: $model.s.nxTarget) {
-                            ForEach(NXTarget.allCases, id: \.self) { Text($0.label).tag($0) }
-                        }
-                        if model.s.nxTarget.isIOS {
-                            labeled("Apple Team ID（可留空，在 Xcode 里选）", $model.s.teamID)
-                            Toggle("免费 Apple ID（不申请“增大内存限制”，大型游戏可能被系统关闭）", isOn: $model.s.freeAppleID)
-                        }
-                        labeled("nxnative 目录", $model.s.nxDir)
-                        labeled(model.s.nxTarget == .ipa ? "生成位置（IPA 与此同名，后缀换成 .ipa）" : "生成的 App", $model.s.outputApp, choose: appPicker)
-                        labeled("构建文件夹（放游戏文件的链接和中间文件）", $model.s.workDir, choose: workPicker)
-                        if model.s.nxTarget == .xcode {
-                            labeled("Xcode 工作区（留空 = 构建文件夹旁的 sw-launcher.xcworkspace）", $model.s.nxWorkspace) {
-                                model.pickSave(title: "选择 Xcode 工作区位置", current: model.s.nxWorkspace.isEmpty ? nxWorkspacePath(stage: (model.s.workDir as NSString).expandingTildeInPath) : model.s.nxWorkspace)
-                            }
-                        }
-                    } else {
-                        labeled("构建工具目录", $model.s.projectDir)
-                        labeled("生成的 App", $model.s.outputApp, choose: appPicker)
-                        labeled("构建缓存目录", $model.s.workDir, choose: workPicker)
-                    }
-                }.padding(.top, 8)
-            }.font(.system(size: 12))
+            labeled(g.backend == .nxnative && model.s.nxTarget == .ipa ? "生成位置（IPA 与此同名，后缀换成 .ipa）" : "生成的 App", $model.s.outputApp, choose: appPicker)
+            labeled(g.backend == .nxnative ? "构建文件夹（放游戏文件的链接和中间文件）" : "构建缓存目录", $model.s.workDir, choose: workPicker)
+            if g.backend == .nxnative && model.s.nxTarget == .xcode {
+                labeled("Xcode 工作区（留空 = 构建文件夹旁的 sw-launcher.xcworkspace）", $model.s.nxWorkspace) {
+                    model.pickSave(title: "选择 Xcode 工作区位置", current: model.s.nxWorkspace.isEmpty ? nxWorkspacePath(stage: (model.s.workDir as NSString).expandingTildeInPath) : model.s.nxWorkspace)
+                }
+            }
+            Text("游戏文件、版本、构建目标、存档和 Mods 在主窗口右侧设置。").font(.system(size: 11)).foregroundStyle(.secondary)
         }
-    }
-
-    @ViewBuilder var macFiles: some View {
-        PathRow(title: model.s.selected == .botw ? "游戏本体（基础版 NSP）" : "游戏本体（XCI / NSP）", tag: .required, value: $model.s.game, check: model.check(.game)) {
-            if let p = model.pick(directory: false, extensions: ["xci", "nsp"], title: "选择游戏本体") { model.s.game = p }
-        }
-        PathRow(title: "prod.keys", tag: .required, value: $model.s.keys, check: model.check(.keys)) {
-            if let p = model.pick(directory: false, extensions: ["keys"], title: "选择 prod.keys") { model.s.keys = p }
-        }
-        PathRow(title: "固件（文件夹或 .zip）", tag: .required, value: $model.s.firmware, check: model.check(.firmware)) {
-            if let p = model.pick(directory: true, extensions: ["zip"], title: "选择固件") { model.s.firmware = p }
-        }
-        PathRow(title: model.s.selected == .botw ? "更新包（1.9.0，NSP）" : "更新包（1.1.2 / 1.4.3，NSP 或 NSZ）", tag: model.s.selected == .botw ? .required : .optional, value: $model.s.update, check: model.check(.update)) {
-            model.choose(.update)
-        }
-    }
-
-    @ViewBuilder var nxFiles: some View {
-        PathRow(title: "游戏本体（NSP / XCI / NSZ / XCZ）", tag: .required, value: $model.s.game, check: model.check(.game)) {
-            if let p = model.pick(directory: false, extensions: ["nsp", "xci", "nsz", "xcz"], title: "选择游戏本体") { model.s.game = p }
-        }
-        PathRow(title: "更新包（文件名要带 [v版本号]）", tag: model.needsUpdate ? .required : .optional, value: $model.s.update, check: model.check(.update)) {
-            model.choose(.update)
-        }
-        PathRow(title: "DLC 文件夹", tag: .optional, value: $model.s.dlc, check: model.check(.dlc)) {
-            if let p = model.pick(directory: true, title: "选择放 DLC 文件的文件夹") { model.s.dlc = p }
-        }
-        PathRow(title: "prod.keys", tag: .required, value: $model.s.keys, check: model.check(.keys)) {
-            if let p = model.pick(directory: false, extensions: ["keys"], title: "选择 prod.keys") { model.s.keys = p }
-        }
-        Label("nxnative 不需要固件。构建时游戏文件只做符号链接，不复制；放在外置硬盘上也行。", systemImage: "info.circle")
-            .font(.system(size: 11)).foregroundStyle(.secondary)
     }
 
     func labeled(_ title: String, _ binding: Binding<String>, choose: (() -> String?)? = nil) -> some View {
@@ -2059,41 +2067,31 @@ struct SettingsView: View {
     func appPicker() -> String? { model.pickSave(title: "选择生成位置", current: model.s.outputApp) }
     func workPicker() -> String? { model.pick(directory: true, title: "选择构建文件夹") }
 
-    var systemTab: some View {
-        let i = model.info
-        return pane {
+    var generalTab: some View {
+        pane {
             HStack(spacing: 8) {
-                Text("游戏语言").font(.system(size: 13, weight: .medium)); TagView(kind: .required)
+                Text("游戏语言").font(.system(size: 13, weight: .medium))
                 Spacer()
                 Picker("", selection: $model.s.language) { ForEach(Language.all) { Text($0.name).tag($0.code) } }.labelsHidden().frame(width: 190)
             }
-            Toggle("显示游戏封面（还没构建的游戏从任天堂官方商店服务器下载图标并缓存）", isOn: $model.s.showCovers).font(.system(size: 12))
+            Text("所有游戏通用；游戏不支持所选语言时用它自己的默认语言。").font(.system(size: 11)).foregroundStyle(.secondary)
             Divider()
-            Text("这台 Mac").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
-            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 9) {
-                GridRow { Text("系统").foregroundStyle(.secondary); Text("macOS \(i.macOS)（\(i.build)）") }
-                GridRow { Text("芯片").foregroundStyle(.secondary); Text("\(i.chip)\(i.family.map { " · M\($0) 系列" } ?? "")") }
-                GridRow { Text("内存").foregroundStyle(.secondary); Text("\(i.memGB) GB") }
-                GridRow { Text("图形").foregroundStyle(.secondary); HStack(spacing: 6) { Chip(text: "Metal 3", ok: i.metal3); Chip(text: "Metal 4", ok: i.metal4) } }
-                GridRow { Text("机型").foregroundStyle(.secondary); Text(i.model) }
-            }.font(.system(size: 13))
+            Toggle("显示游戏封面", isOn: $model.s.showCovers).font(.system(size: 13))
+            Text("还没构建的游戏从任天堂官方商店服务器下载图标并缓存在本机。").font(.system(size: 11)).foregroundStyle(.secondary)
+            Spacer(minLength: 24)
             Divider()
-            Text("运行要求").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 7) {
-                requirement("macOS 26 或更新", ok: i.major >= 26, now: "当前 \(i.macOS)")
-                requirement("Metal 4", ok: i.metal4, now: i.metal4 ? "已支持" : "不支持")
-                requirement("Apple 芯片（M1–M5）", ok: i.arm64, now: i.family.map { "M\($0) 系列" } ?? i.chip)
-                requirement("建议 16 GB 或更多内存", ok: i.memGB >= 16, now: "当前 \(i.memGB) GB")
+            HStack(spacing: 12) {
+                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 40, height: 40)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("sw-launcher " + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")).font(.system(size: 13, weight: .semibold))
+                    Text("不含任何游戏内容；游戏、密钥和固件必须是你自己的。").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
             }
-        }
-    }
-
-    func requirement(_ text: String, ok: Bool, now: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill").foregroundStyle(ok ? accent : .red)
-            Text(text).font(.system(size: 13))
-            Spacer()
-            Text(now).font(.system(size: 12)).foregroundStyle(.secondary)
+            HStack(spacing: 14) {
+                Link("nxnative", destination: URL(string: "https://github.com/seedds/nxnative")!)
+                Link("MacNativeGames", destination: URL(string: "https://github.com/ly05010419/MacNativeGames")!)
+                Link("教程（AppleGamingWiki）", destination: URL(string: "https://www.applegamingwiki.com/wiki/Nxnative_Switch_to_Mac_conversion")!)
+            }.font(.system(size: 12))
         }
     }
 
@@ -2125,6 +2123,7 @@ struct SettingsView: View {
 
     var macGraphicsTab: some View {
         pane {
+            gamePicker
             Text("预编译着色器").font(.system(size: 13, weight: .semibold))
             Text("把游戏的着色器提前编译成文件保存在本机，不依赖系统缓存。系统缓存被清掉时，预热也只要几秒，而不是几分钟。").font(.system(size: 12)).foregroundStyle(.secondary)
             HStack(spacing: 24) {
@@ -2158,7 +2157,7 @@ struct SettingsView: View {
                 Text("下载源").font(.system(size: 12))
                 Picker("", selection: $model.s.network) { ForEach(NetworkMode.allCases, id: \.self) { Text($0.label).tag($0) } }.labelsHidden().frame(width: 320)
             }
-            Text(model.netSummary + "。Homebrew、Python 组件、MacNativeGames 和 nxnative 会走所选的源；Xcode、Metal Toolchain 来自 Apple，.NET 来自微软。")
+            Text(model.netSummary + "。Homebrew、Python 组件、MacNativeGames 和 nxnative 会走所选的源；NuGet（nx_extract 的依赖）除非选“总是用官方源”，一律走华为云镜像（官方源时常断连）；Xcode、Metal Toolchain 来自 Apple，.NET 来自微软。")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             Text(model.s.selected.backend == .nxnative ? "当前游戏用 nxnative 构建" : "当前游戏用 MacNativeGames 构建").font(.system(size: 11)).foregroundStyle(.secondary)
             ForEach(model.deps) { dep in DepRow(dep: dep) { model.install(dep.id) } }
@@ -2175,72 +2174,23 @@ struct SettingsView: View {
         }
     }
 
-    var extrasTab: some View {
-        pane {
-            gamePicker.onChange(of: model.s.selected) { model.refreshMods() }.onAppear { model.refreshMods() }
-            PathRow(title: "存档", tag: .optional, value: $model.s.save, check: model.check(.save)) {
-                if let p = model.pick(directory: true, title: "选择存档文件夹") { model.s.save = p }
-            }
-            HStack {
-                Button("导入存档到游戏…") { model.importSave() }.disabled({ if case .ok = model.check(.save) { return false }; return true }())
-                Button("打开游戏存档文件夹") { model.openFolder(model.paths.profileSave) }
-            }
-            Text("导入前会自动备份现有存档。第一次需要先启动一次游戏，让它创建存档目录。").font(.system(size: 11)).foregroundStyle(.secondary)
-            Divider()
-            Text("Mods（RomFS 替换）").font(.system(size: 13, weight: .medium))
-            HStack(spacing: 8) {
-                TextField("选择…", text: $model.s.mods).textFieldStyle(.roundedBorder).font(.system(size: 12))
-                Button("选择…") { if let p = model.pick(directory: true, title: "选择 Mods 文件夹") { model.s.mods = p; model.refreshMods() } }
-                Button("刷新") { model.refreshMods() }
-            }
-            if model.modList.isEmpty {
-                Text(model.s.mods.isEmpty ? "选择一个 Mods 文件夹。" : "这个文件夹里没有找到 mod（需要 <mod>/romfs/… 或 contents/\(model.s.selected.titleID)/<mod>/romfs/…）。")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(Array(model.modList.enumerated()), id: \.element.name) { i, m in
-                        HStack(spacing: 8) {
-                            Toggle("", isOn: Binding(get: { model.modEnabled(m.name) }, set: { model.setMod(m.name, enabled: $0) })).labelsHidden().toggleStyle(.switch).controlSize(.mini).tint(accent)
-                            Text(m.name).font(.system(size: 12)).lineLimit(1)
-                            Spacer()
-                            let c = model.modEnabled(m.name) ? model.conflictCount(m.name) : 0
-                            Text("\(m.files.count) 个文件").font(.system(size: 11)).foregroundStyle(.secondary)
-                            if c > 0 { Text("\(c) 个冲突").font(.system(size: 11)).foregroundStyle(.orange).help(model.modResolution.conflicts.filter { $0.value.contains(m.name) }.keys.sorted().prefix(20).joined(separator: "\n")) }
-                            if m.files.contains(where: model.modWarnings.contains) { Text("含新增文件，不支持").font(.system(size: 11)).foregroundStyle(.orange) }
-                            Button { model.moveMod(m.name, by: -1) } label: { Image(systemName: "chevron.up") }.buttonStyle(.borderless).disabled(i == 0)
-                            Button { model.moveMod(m.name, by: 1) } label: { Image(systemName: "chevron.down") }.buttonStyle(.borderless).disabled(i == model.modList.count - 1)
-                        }.padding(.vertical, 4)
-                    }
-                }
-            }
-            Text(model.s.selected.backend == .nxnative
-                 ? "nxnative 启动时先在 mod 的 romfs 文件夹里找文件，找不到再读游戏原版（DM_ROMFS_OVERLAY）。多个 mod 改了同一个文件时，列表里靠下的生效。改动在下次启动时生效，不用重新构建。暂不支持 ExeFS 补丁和金手指。"
-                 : "只支持替换游戏里已有的文件（romfs 文件夹）。多个 mod 改了同一个文件时，列表里靠下的生效。改动在下次启动时生效，不用重新构建。暂不支持 ExeFS 补丁和金手指。").font(.system(size: 11)).foregroundStyle(.secondary)
-        }
-    }
-
-    var aboutTab: some View {
-        pane {
-            HStack(spacing: 14) {
-                IconView(image: model.appIcon, size: 64)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("sw-launcher").font(.system(size: 18, weight: .bold))
-                    Text("版本 1.5.0 · \(GameKind.all.count) 款游戏：MacNativeGames 2 款（王国之泪、旷野之息），nxnative \(GameCatalog.nx.count) 款 · Apple 芯片").font(.system(size: 12)).foregroundStyle(.secondary)
-                }
-            }
-            Text("这个启动器只负责检测环境、调用构建脚本、导入存档、管理 Mods 和启动游戏。游戏本体、密钥和固件都必须是你自己的，启动器不包含任何游戏内容。").font(.system(size: 12)).foregroundStyle(.secondary)
-            Link("构建工具：nxnative（GitHub）", destination: URL(string: "https://github.com/seedds/nxnative")!).font(.system(size: 12))
-            Link("构建工具：MacNativeGames（GitHub）", destination: URL(string: "https://github.com/ly05010419/MacNativeGames")!).font(.system(size: 12))
-            Link("教程：AppleGamingWiki · Nxnative Switch to Mac conversion", destination: URL(string: "https://www.applegamingwiki.com/wiki/Nxnative_Switch_to_Mac_conversion")!).font(.system(size: 12))
-        }
-    }
 }
 
 // MARK: - App
 
+/// Closing the window quits the launcher (a hidden copy kept running after an update would keep running the old code), except while
+/// a build or a start is in progress.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    @MainActor static weak var model: Model?
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        MainActor.assumeIsolated { AppDelegate.model.map { $0.busy == nil && !$0.launching } ?? true }
+    }
+}
+
 @main
 struct LauncherApp: App {
     @StateObject private var model = Model()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
         let args = CommandLine.arguments
@@ -2272,7 +2222,7 @@ struct LauncherApp: App {
 
     var body: some Scene {
         WindowGroup("sw-launcher") {
-            MainView(model: model).preferredColorScheme(.dark)
+            MainView(model: model).preferredColorScheme(.dark).onAppear { AppDelegate.model = model }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1240, height: 760)

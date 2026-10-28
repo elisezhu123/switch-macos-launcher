@@ -33,6 +33,20 @@ func testExtractedIcon() {
     expect(!back.showCovers && (try! JSONDecoder().decode(LauncherSettings.self, from: Data("{}".utf8))).showCovers, "covers setting: kept, on by default")
 }
 
+func testDamagedFiles() {
+    let logs = tempHome().appendingPathComponent("01007EF00011E000_build/logs")
+    expect(nxDamagedFiles(logs: logs).isEmpty, "no logs")
+    write("main build id cd57\n[RED] hash check failed: /Sound/Resource/Stream/Event_BGM_CompleteMasterSword.bfstm\n[RED] the NSP is damaged: 1 files\n",
+          to: logs.appendingPathComponent("extract_v1114112.log"))
+    let found = nxDamagedFiles(logs: logs)
+    expect(found == ["/Sound/Resource/Stream/Event_BGM_CompleteMasterSword.bfstm"], "read from the log: \(found)")
+    expect(nxDamagedFiles(logs: logs, since: Date().addingTimeInterval(60)).isEmpty, "older logs are ignored")
+    expect(nxDamageIsKnown(found, titleID: "01007EF00011E000"), "BOTW's known damage")
+    expect(!nxDamageIsKnown(found + ["/Actor/Pack/Link.sbactorpack"], titleID: "01007EF00011E000"), "any other damage stops")
+    expect(!nxDamageIsKnown(found, titleID: "0100F2C0115B6000") && !nxDamageIsKnown([], titleID: "01007EF00011E000"), "other games, nothing found")
+    expect(nxBuildCommand(venv: "/v", stage: "/s", keys: "/k", app: "/a", allowDamaged: true).contains("-k '/k' --allow-damaged --platform mac-app"), "the flag")
+}
+
 func testVersionSelection() {
     let wonder = GameKind.nx("010015100B514000")
     var gs = GameSettings()
@@ -79,6 +93,9 @@ func testProxyDetectionAndMirrors() {
     expect(systemProxyEnvironment(scutil: off).isEmpty, "no proxy, no variables")
     let ne = networkEnvironment(mirror: true, proxy: pe)
     expect(ne["PIP_INDEX_URL"] == Mirrors.pypi && ne["https_proxy"] != nil && ne["PIP_DEFAULT_TIMEOUT"] == "60", "mirror + proxy + pip timeout")
+    expect(ne["RestoreSources"] == Mirrors.nuget && networkEnvironment(mirror: false, proxy: [:])["RestoreSources"] == nil, "NuGet mirror with the mirrors")
+    expect(networkEnvironment(mirror: false, proxy: pe, nugetMirror: true)["RestoreSources"] == Mirrors.nuget, "NuGet mirror on its own")
+    expect(officialSourcesProbe().contains("api.nuget.org"), "NuGet is probed too")
     expect(useMirrors(.auto, proxy: true, officialFast: false) && !useMirrors(.direct, proxy: true, officialFast: false), "slow official sources")
     let script = terminalInstallScript(["a", "b"])
     expect(script.hasPrefix("{ sudo -v;") && script.contains("a; b; kill $KEEP"), "one password, then each installer: \(script)")
@@ -352,7 +369,7 @@ func testRunningNxGameIsFoundByItsHost() {
 }
 
 let nxTests: [(String, () -> Void)] = [
-    ("testExtractedIcon", testExtractedIcon), ("testProxyDetectionAndMirrors", testProxyDetectionAndMirrors), ("testVersionSelection", testVersionSelection), ("testAutoInstallSettingRoundTrip", testAutoInstallSettingRoundTrip),
+    ("testDamagedFiles", testDamagedFiles), ("testExtractedIcon", testExtractedIcon), ("testProxyDetectionAndMirrors", testProxyDetectionAndMirrors), ("testVersionSelection", testVersionSelection), ("testAutoInstallSettingRoundTrip", testAutoInstallSettingRoundTrip),
     ("testCatalogHasAllNxnativeGames", testCatalogHasAllNxnativeGames), ("testGameKindIsAPlainStringInJSON", testGameKindIsAPlainStringInJSON),
     ("testNxPathsFollowTheMacApp", testNxPathsFollowTheMacApp), ("testNxDefaultsAndNames", testNxDefaultsAndNames),
     ("testV110SettingsFileStillLoads", testV110SettingsFileStillLoads), ("testNxChoicesRoundTrip", testNxChoicesRoundTrip),

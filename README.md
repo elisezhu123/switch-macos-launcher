@@ -18,20 +18,22 @@
 
 ### 重要声明（请务必阅读）
 
-- **不含任何游戏内容。** 本仓库和 Release 里没有游戏本体、`prod.keys`、固件，也没有游戏封面等素材。游戏库里的封面是运行时从任天堂官方商店服务器下载并缓存在本机的图标（设置 → 系统 可关闭）；已构建的游戏用从你自己的文件里解出的图标。
+- **不含任何游戏内容。** 本仓库和 Release 里没有游戏本体、`prod.keys`、固件，也没有游戏封面等素材。游戏库里的封面是运行时从任天堂官方商店服务器下载并缓存在本机的图标（设置 → 通用 可关闭）；已构建的游戏用从你自己的文件里解出的图标。
 - **游戏必须由你自己从你自己的 Switch 中获取**，包括游戏本体（XCI / NSP）、`prod.keys` 和固件。
 - **不得分发、不得出售**游戏、密钥、固件，或用本项目构建出来的包含游戏数据的 App。**仅限个人使用。**
 - 本项目与任天堂无关，《塞尔达传说》及相关名称、商标归任天堂所有。
 
 ### 截图
 
-| 游戏文件 | 系统 |
-|---|---|
-| ![游戏文件](docs/settings-files.png) | ![系统](docs/settings-system.png) |
+游戏文件、版本、构建目标、存档和 Mods 都在主窗口右侧的详情面板里。设置（⌘,）只剩四页：
 
-| 图形（预编译着色器） | 环境 |
+| 通用（语言、封面） | 游戏（帧率、线程等） |
 |---|---|
-| ![图形](docs/settings-graphics.png) | ![环境](docs/settings-environment.png) |
+| ![通用](docs/settings-general.png) | ![游戏](docs/settings-game.png) |
+
+| 环境 | 高级（目录） |
+|---|---|
+| ![环境](docs/settings-environment.png) | ![高级](docs/settings-advanced.png) |
 
 ### 功能
 
@@ -40,7 +42,7 @@
 - **Mods**：支持替换游戏文件的 RomFS mod，见下文。
 - **系统检测**：macOS 版本、芯片（M1–M5 系列）、内存、Metal 3 / Metal 4；顶部和状态栏明确写出 **macOS 26+、Metal 4** 的要求，不满足时给出"不支持"。
 - **环境检查与后台安装**：检查 Xcode 命令行工具、Homebrew、Python 3.14、opus / libvpx、构建工具、**Metal Toolchain（839 MB）**、磁盘空间；缺什么就后台下载并显示进度。v1.4.0 起默认**自动在后台安装**不需要密码的组件（按顺序、前置条件就绪后逐个安装，失败不自动重试，左下角可关闭）；Homebrew、命令行工具、.NET、Xcode 需要密码或 App Store，列在左下角，点“安装”在“终端”里运行。v1.5.0 起有**一键安装全部**：需要密码的几项合进一个“终端”窗口依次执行，只输一次密码；Xcode 打开 App Store；其余在后台安装。
-- **下载源**（v1.5.0，设置 → 环境）：自动 / 官方源 / 国内镜像。自动 = 没有代理、或 PyPI / GitHub 4 秒内没响应时走镜像（Homebrew 与 PyPI：清华 TUNA；Homebrew 安装脚本：中科大；git：ghfast.top，第三方代理）。MacNativeGames 按提交哈希下载，镜像改不了内容。系统代理会传给所有安装和构建命令。
+- **下载源**（v1.5.0，设置 → 环境）：自动 / 官方源 / 国内镜像。自动 = 没有代理、或 PyPI / GitHub 4 秒内没响应时走镜像（Homebrew 与 PyPI：清华 TUNA；Homebrew 安装脚本：中科大；git：ghfast.top，第三方代理）。NuGet（nxnative 解包工具 nx_extract 的依赖）除非选“总是用官方源”，一律走华为云镜像，因为 api.nuget.org 时常断连。MacNativeGames 按提交哈希下载，镜像改不了内容。系统代理会传给所有安装和构建命令。
 - **语言**：12 种，**默认简体中文**。游戏本体自带简体 / 繁体等文本，不需要额外的汉化补丁。
 - **存档**：选择存档文件夹后一键导入，**覆盖前自动备份**。
 - **构建**：调用 MacNativeGames 的构建脚本，显示 4 步进度；自动准备一份清理过的 `prod.keys` 副本（去掉会让 hactool 报错的行，原文件不动）。
@@ -50,10 +52,10 @@
 
 - **构建**：游戏本体 + 对应版本的更新（文件名要带 `[v版本号]`）+ 可选 DLC + `prod.keys`，**不需要固件**。启动器用 `scripts/build_ipa_from_nsp.py --platform mac-app --progress json` 构建，进度条读它的 JSON 事件；游戏文件只做符号链接（nxnative 要求一个文件夹一款游戏），不复制。
 - **环境**：Xcode（选用并同意许可）、Metal Toolchain、git / zstd / spirv-cross / lz4 / glslang、.NET SDK 10、nxnative 本体，以及装在启动器自己 Python 环境里的 capstone / fonttools / lz4 / nsz。每一项都要你点“安装”。
-- **多线程**：设置 → 图形里的“着色器预热线程数”写成 `DM_PSO_PREPARE_THREADS`（默认等于 CPU 核心数）。
+- **多线程**：设置 → 游戏里的“着色器预热线程数”写成 `DM_PSO_PREPARE_THREADS`（默认等于 CPU 核心数）。
 - **Mods**：沿用同一份 mods 列表（开关、顺序、冲突），启动时转成 nxnative 自带的 `DM_ROMFS_OVERLAY`：先读 mod 里的文件，没有的再读原版；不用重新构建。
 - **其他设置**（帧率 30/60、渲染比例、主机/掌机、MetalFX、手柄震动、Metal 4 管线等）按游戏保存，写进 `~/Library/Application Support/nxnative/<标题ID>/env.txt` 里启动器自己的那一段；你手写在段外的行优先。语言只在游戏支持时写入（读构建时解出的 `control.nacp`）。
-- **iPad / iPhone**（v1.2.0）：设置 → 高级 → “构建目标”可选 Xcode 工程（推荐）或 IPA。Xcode 工程：构建完自动打开，登录自己的 Apple ID（免费的也行）、选 Personal Team、连上 iPad 点 Run；免费账号签名 7 天过期，重新 Run 即可，且不能申请“增大内存限制”（大型游戏可能被系统关闭）。IPA：用 Sideloadly / AltStore 签名安装。iOS 构建需要 Xcode，**整条流程未在真机验证**。
+- **iPad / iPhone**（v1.2.0）：主窗口右侧“构建目标”可选 iPad/iPhone（Xcode 工程，推荐）或 IPA。Xcode 工程：构建完自动打开，登录自己的 Apple ID（免费的也行）、选 Personal Team、连上 iPad 点 Run；免费账号签名 7 天过期，重新 Run 即可，且不能申请“增大内存限制”（大型游戏可能被系统关闭）。IPA：用 Sideloadly / AltStore 签名安装。iOS 构建需要 Xcode，**整条流程未在真机验证**。
 - **存档**在 `~/Library/Application Support/nxnative/<标题ID>/save`，日志在 `~/Library/Logs/nxnative/<标题ID>.log`。
 - **未验证**：整条 nxnative 构建流程（装依赖、30–60 分钟的首次构建、启动）没有在真机上完整跑过；命令生成、设置、env.txt、overlay、进度解析、运行检测有单元测试。遇到问题请先看日志。
 - nxnative 的游戏目录由 `scripts/gen-catalog.py` 从它的 `dm/games` 生成到 `NXCatalog.swift`。
@@ -79,7 +81,7 @@
 
 ### Mods（RomFS 替换）
 
-- 在“设置 → 存档与 Mods”里选一个 Mods 文件夹。两种结构都认：`<Mods 文件夹>/<mod 名>/romfs/...`，以及 Ryujinx 的 `<Mods 文件夹>/contents/<游戏 ID>/<mod 名>/romfs/...`（只取当前游戏 ID 下的）。王国之泪的 ID 是 `0100F2C0115B6000`，旷野之息是 `01007EF00011E000`。
+- 在主窗口右侧的“Mods”里选一个 Mods 文件夹。两种结构都认：`<Mods 文件夹>/<mod 名>/romfs/...`，以及 Ryujinx 的 `<Mods 文件夹>/contents/<游戏 ID>/<mod 名>/romfs/...`（只取当前游戏 ID 下的）。王国之泪的 ID 是 `0100F2C0115B6000`，旷野之息是 `01007EF00011E000`。
 - 每个 mod 可以单独开关、调整顺序；多个 mod 改了同一个文件时，**列表里靠下的生效**，界面上会标出冲突数。设置按游戏分开保存。
 - 改动在下次点“启动”时生效，**不用重新构建**。全部关掉时，游戏读到的就是原版文件。
 - **只能替换游戏里已有的文件**。mod 里原版没有的新文件会被跳过，游戏照常启动，启动器会标出“含新增文件，不支持”。
@@ -108,7 +110,7 @@
    ```
 
    也可以右键 → 打开，再在系统设置 → 隐私与安全性里点"仍要打开"。
-3. 打开 App → 在游戏库里选中要玩的游戏 → 设置（⌘,）→ 填入游戏本体（旷野之息还要 1.9.0 更新）、`prod.keys`、固件 → 在"环境"页把缺的东西装好 → 回到主窗口点"构建"，等进度条走完 → 点"启动"。
+3. 打开 App → 左下角点“一键安装全部”把缺的组件装好 → 在游戏库里选中要玩的游戏 → 在右侧选版本，点击添加游戏本体（和对应的更新包）、`prod.keys`（MacNativeGames 的游戏还要固件）→ 点“构建”，等进度条走完 → 点“启动”。
 4. 从 v1.0.x 升级：已经装好的构建工具只打过第一个补丁，在"环境"页点"Mac 兼容补丁与旷野之息移植"的"安装"，只会补打缺少的补丁。
 
 ### 从源码构建
@@ -162,11 +164,11 @@ It is **derived from [MacNativeGames](https://github.com/ly05010419/MacNativeGam
 
 **BOTW (experimental, `sw-port.patch`)**: needs the base NSP and the 1.9.0 update NSP. It builds and starts, showing the opening flash and the Shrine of Resurrection; lighting is incomplete, MetalFX and frame interpolation are not adapted yet, first start translates shaders on use. Some 1.9.0 update copies have one damaged 1 MiB region inside `Event_BGM_CompleteMasterSword.bfstm`; that case builds with a warning, any damage elsewhere stops the build and names the file.
 
-**Mods (RomFS)**: pick a mods folder in Settings → 存档与 Mods. Layouts `<mods>/<mod>/romfs/...` and Ryujinx's `<mods>/contents/<title ID>/<mod>/romfs/...`. Per-mod on/off and order (later wins, conflicts shown), applied at the next start without rebuilding. Only files the game already has can be replaced; new files are skipped and flagged. No ExeFS patches or cheats.
+**Mods (RomFS)**: pick a mods folder in the Mods section of the detail pane. Layouts `<mods>/<mod>/romfs/...` and Ryujinx's `<mods>/contents/<title ID>/<mod>/romfs/...`. Per-mod on/off and order (later wins, conflicts shown), applied at the next start without rebuilding. Only files the game already has can be replaced; new files are skipped and flagged. No ExeFS patches or cheats.
 
 **nxnative backend (v1.2.0)**: builds from the base game, the matching update (file name must carry `[v<version>]`), optional DLC and `prod.keys` — **no firmware needed**. The launcher runs nxnative's `build_ipa_from_nsp.py --progress json` and only symlinks your game files. Settings (shader pre-warm threads → `DM_PSO_PREPARE_THREADS`, fps, render scale, docked/handheld, MetalFX, language, …) are written per game into the launcher's own block of `~/Library/Application Support/nxnative/<title ID>/env.txt`; the same mods list is passed as `DM_ROMFS_OVERLAY`. The environment page installs Xcode tools, Metal Toolchain, Homebrew packages, .NET SDK 10 and nxnative, each only after you click Install.
 
-**iPad / iPhone (v1.2.0)**: Settings → 高级 → build target: **Xcode project** (recommended; opens when done — sign in with your Apple ID, free accounts work, pick your Personal Team, connect the iPad and Run), **IPA** (sign with Sideloadly / AltStore), or **Mac App**. Free accounts expire after 7 days and cannot get the Increased Memory Limit entitlement, so large games may be closed by iOS. **The full nxnative build (Mac and iOS) has not been run end to end on real hardware yet**; command generation, settings, env.txt, overlay and progress parsing are unit tested.
+**iPad / iPhone (v1.2.0)**: build target in the detail pane: **Xcode project** (recommended; opens when done — sign in with your Apple ID, free accounts work, pick your Personal Team, connect the iPad and Run), **IPA** (sign with Sideloadly / AltStore), or **Mac App**. Free accounts expire after 7 days and cannot get the Increased Memory Limit entitlement, so large games may be closed by iOS. **The full nxnative build (Mac and iOS) has not been run end to end on real hardware yet**; command generation, settings, env.txt, overlay and progress parsing are unit tested.
 
 **Not implemented / known issues**: On the test machine (M1 Max, macOS 27) the 1080p start mode and the MetalFX mode show a black window while the full 2560×1440 output works; the scene and the upscaled output are rendered correctly, the failure is in the last step that puts the picture on the window. The root cause was not found, v1.0.1 simply avoids those modes by default.
 
