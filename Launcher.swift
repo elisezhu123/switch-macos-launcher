@@ -171,6 +171,7 @@ final class Model: ObservableObject {
         didSet {
             if !isDemoMode { s.write(to: Paths.config) }
             if s.selected.backend != oldValue.selected.backend { refreshDeps() }   // each backend has its own list of requirements
+            if s.nxTarget != oldValue.nxTarget { refreshDeps() }   // an iPad / iPhone target also needs xcodegen
             if s.network != oldValue.network { Model.autoTried.removeAll(); refreshDeps() }   // other download sources: worth another try
             if s.showCovers != oldValue.showCovers { coverRequested.removeAll(); covers = [:]; if s.showCovers { preloadCovers() } }
         }
@@ -208,7 +209,7 @@ final class Model: ObservableObject {
             let own = ProcessInfo.processInfo.environment.filter { ["http_proxy", "https_proxy", "all_proxy", "no_proxy"].contains($0.key.lowercased()) }
             proxyEnv = systemProxyEnvironment(scutil: sh("/usr/sbin/scutil --proxy").out).merging(own) { $1 }
         }
-        deps = Model.makeDeps(project: s.projectDir, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror)
+        deps = Model.makeDeps(project: s.projectDir, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror, ios: s.nxTarget.isIOS)
         if !isDemoMode { refreshCatalog() }
         if !isDemoMode && !isSnapshot { probeNetwork() }
         if !isDemoMode { preloadCovers() }   // a snapshot too: it only reads and downloads pictures
@@ -256,7 +257,8 @@ final class Model: ObservableObject {
         }
     }
 
-    static func makeDeps(project: String, nxDir: String, backend: Backend, mirror: Bool = false) -> [Dep] {
+    /// `ios`: an nxnative iPad / iPhone target (Xcode project or IPA), which also needs xcodegen.
+    static func makeDeps(project: String, nxDir: String, backend: Backend, mirror: Bool = false, ios: Bool = false) -> [Dep] {
         let clt = Dep(id: "clt", title: "Xcode 命令行工具", detail: "编译游戏运行时所需", size: "约 1 GB", required: true, install: .terminal("xcode-select --install"))
         let brew = Dep(id: "brew", title: "Homebrew", detail: backend == .macnative ? "安装 Python 和音视频库" : "安装 Python、.NET 和构建工具", size: nil, required: true,
                        install: .terminal(brewInstallCommand(mirror: mirror)))
@@ -284,6 +286,8 @@ final class Model: ObservableObject {
                 metal,
                 Dep(id: "nxtools", title: "构建工具（git、zstd、spirv-cross、lz4、glslang）", detail: "解包、着色器翻译", size: "约 50 MB", required: true,
                     install: .background("/opt/homebrew/bin/brew install git zstd spirv-cross lz4 glslang")),
+                Dep(id: "xcodegen", title: "xcodegen", detail: ios ? "生成 iPad / iPhone 的 Xcode 工程" : "只有构建 iPad / iPhone（Xcode 工程或 IPA）时需要", size: "约 10 MB",
+                    required: ios, install: .background("/opt/homebrew/bin/brew install xcodegen")),
                 Dep(id: "dotnet", title: ".NET SDK 10", detail: "读取游戏文件（nx_extract）；安装包需要你输入密码，会在“终端”里运行", size: "约 400 MB", required: true,
                     install: .terminal("/opt/homebrew/bin/brew install --cask dotnet-sdk")),
                 Dep(id: "nxvenv", title: "Python 组件（capstone、fonttools、lz4、nsz）", detail: "装进启动器自己的环境，不改动系统 Python", size: "约 30 MB", required: true,
@@ -302,7 +306,7 @@ final class Model: ObservableObject {
         let inFlight = Dictionary(uniqueKeysWithValues: deps.compactMap { d -> (String, Dep.State)? in
             if case .installing = d.state { return (d.id, d.state) }; return nil
         })
-        deps = Model.makeDeps(project: project, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror)
+        deps = Model.makeDeps(project: project, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror, ios: s.nxTarget.isIOS)
         for i in deps.indices { if let st = inFlight[deps[i].id] { deps[i].state = st } }
         let ids = deps.map(\.id)
         Task.detached {
@@ -324,6 +328,7 @@ final class Model: ObservableObject {
                 case "nxvenv": results[id] = sh(nxVenvCheckCommand(venv: venv)).status == 0
                 case "nxrepo": results[id] = FileManager.default.fileExists(atPath: nxDir + "/scripts/build_ipa_from_nsp.py")
                 case "metal": results[id] = sh("xcrun -sdk macosx metal --version >/dev/null 2>&1").status == 0
+                case "xcodegen": results[id] = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/xcodegen")
                 case "disk":
                     let v = try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
                     results[id] = (v?.volumeAvailableCapacityForImportantUsage ?? 0) > Int64(needGB) * 1_000_000_000
@@ -343,7 +348,7 @@ final class Model: ObservableObject {
 
     /// What a background installer needs installed first (Homebrew for its packages, Python for the environments, Xcode for the Metal Toolchain).
     static let prerequisites: [String: [String]] = [
-        "python": ["brew"], "libs": ["brew"], "nxtools": ["brew"], "project": ["python", "clt"], "patch": ["project"],
+        "python": ["brew"], "libs": ["brew"], "nxtools": ["brew"], "xcodegen": ["brew"], "project": ["python", "clt"], "patch": ["project"],
         "nxvenv": ["python"], "nxrepo": ["clt"], "metal": ["xcode"],
     ]
     /// Requirements the auto-installer already started once this session: a failure is shown, not retried in a loop.
