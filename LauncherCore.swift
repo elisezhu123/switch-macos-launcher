@@ -878,8 +878,10 @@ enum NXTarget: String, Codable, CaseIterable {
 /// For iOS: `--prepare-xcode` (an Xcode project in a workspace next to the stage folder) or `--platform ios -o <ipa>`.
 /// `freeAppleID` drops the Increased Memory Limit entitlement (`DM_ENTITLEMENTS=` empty), which a free account cannot provision.
 /// No language is passed: the build stops for a language the game lacks; the language is set at launch (DM_LANG in env.txt).
-func nxBuildCommand(venv: String, stage: String, keys: String, app: String, target: NXTarget = .macApp, teamID: String = "", workspace: String = "", freeAppleID: Bool = true) -> String {
-    let base = "\(shQuote(venv + "/bin/python")) scripts/build_ipa_from_nsp.py \(shQuote(stage)) -k \(shQuote(keys))"
+/// `allowDamaged`: go on past files that fail the NCA hash check (only for damage known to be harmless, nxDamageIsKnown).
+func nxBuildCommand(venv: String, stage: String, keys: String, app: String, target: NXTarget = .macApp, teamID: String = "", workspace: String = "",
+                    freeAppleID: Bool = true, allowDamaged: Bool = false) -> String {
+    let base = "\(shQuote(venv + "/bin/python")) scripts/build_ipa_from_nsp.py \(shQuote(stage)) -k \(shQuote(keys))" + (allowDamaged ? " --allow-damaged" : "")
     let team = teamID.isEmpty ? "" : " --team-id \(shQuote(teamID))"
     switch target {
     case .macApp:
@@ -891,6 +893,32 @@ func nxBuildCommand(venv: String, stage: String, keys: String, app: String, targ
     case .ipa:
         return base + " --platform ios -o \(shQuote(app))\(team) --progress json"
     }
+}
+
+// MARK: - nxnative: damaged game files
+
+/// Damage known to be harmless: some copies of Breath of the Wild's 1.9.0 update have one damaged 1 MiB region, always inside this
+/// music track (the same case the MacNativeGames build lets through with a warning).
+let nxKnownDamage: [String: Set<String>] = ["01007EF00011E000": ["/Sound/Resource/Stream/Event_BGM_CompleteMasterSword.bfstm"]]
+
+/// The files nx_extract reported failing the hash check, from the logs of a build folder (`<stage>/<title ID>_build/logs`) written
+/// since `since` (older logs belong to earlier builds).
+func nxDamagedFiles(logs: URL, since: Date = .distantPast) -> [String] {
+    let fm = FileManager.default
+    var out = Set<String>()
+    for f in (try? fm.contentsOfDirectory(at: logs, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] where f.pathExtension == "log" {
+        guard ((try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) >= since,
+              let text = try? String(contentsOf: f, encoding: .utf8) else { continue }
+        for line in text.split(separator: "\n") {
+            if let r = line.range(of: "hash check failed: ") { out.insert(String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)) }
+        }
+    }
+    return out.sorted()
+}
+
+/// A build that stopped on damaged files may run again with --allow-damaged only when every damaged file is known to be harmless.
+func nxDamageIsKnown(_ files: [String], titleID: String) -> Bool {
+    !files.isEmpty && files.allSatisfy { nxKnownDamage[titleID]?.contains($0) == true }
 }
 
 /// The IPA next to the Mac app's path: `~/Games/X/Game.app` -> `~/Games/X/Game.ipa`.

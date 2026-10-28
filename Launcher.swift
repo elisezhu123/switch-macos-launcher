@@ -988,14 +988,31 @@ extension Model {
                 notice = "无法准备构建文件夹：\(error.localizedDescription)"; return
             }
             log += "构建文件夹：\(stage)\n" + files.map { "  \($0.lastPathComponent)\n" }.joined()
-            let lines = LineBuffer()
-            var totalStages = 0
-            let status = await runStreaming(nxBuildCommand(venv: Paths.nxVenv.path, stage: stage, keys: keys, app: output, target: target, teamID: teamID, workspace: workspace, freeAppleID: free), cwd: nxDir, env: netEnv.merging(Model.nxToolEnvironment) { $1 }) { text in
-                let whole = lines.feed(text)
-                Task { @MainActor in for l in whole { totalStages = self.handleNXBuildLine(l, total: totalStages) } }
+            let env = netEnv.merging(Model.nxToolEnvironment) { $1 }
+            func run(allowDamaged: Bool) async -> Int32 {
+                let lines = LineBuffer()
+                var totalStages = 0
+                let status = await runStreaming(nxBuildCommand(venv: Paths.nxVenv.path, stage: stage, keys: keys, app: output, target: target, teamID: teamID,
+                                                               workspace: workspace, freeAppleID: free, allowDamaged: allowDamaged), cwd: nxDir, env: env) { text in
+                    let whole = lines.feed(text)
+                    Task { @MainActor in for l in whole { totalStages = self.handleNXBuildLine(l, total: totalStages) } }
+                }
+                if let rest = lines.flush() { await MainActor.run { self.log += rest + "\n" } }
+                return status
+            }
+            let started = Date()
+            var status = await run(allowDamaged: false)
+            // A damaged copy: run again past it only when all of the damage is the known, harmless kind; otherwise name the files.
+            let logs = URL(fileURLWithPath: stage).appendingPathComponent("\(info.id)_build/logs")
+            let damaged = status == 0 ? [] : nxDamagedFiles(logs: logs, since: started)
+            var damageNote: String? = nil
+            if nxDamageIsKnown(damaged, titleID: info.id) {
+                log += "\n更新包有一处已知的损坏（\(damaged.joined(separator: "、"))），不影响游戏，带上 --allow-damaged 重新构建…\n"
+                step = "跳过已知的损坏，重新构建"
+                damageNote = "这份更新包里有一处已知的损坏，只在拔出大师之剑时的一段背景音乐里，已照常构建；那段音乐播放时可能有杂音。"
+                status = await run(allowDamaged: true)
             }
             await MainActor.run {
-                if let rest = lines.flush() { self.log += rest + "\n" }
                 self.busy = nil; self.progress = nil; self.step = ""
                 let fm = FileManager.default
                 let built: Bool
@@ -1004,13 +1021,15 @@ extension Model {
                 case .xcode: built = fm.fileExists(atPath: workspace)
                 case .ipa: built = fm.fileExists(atPath: ipa)
                 }
-                let failed = "构建没有成功，请展开下面的日志查看原因。如果提示没有这个游戏或版本的档案，说明文件的版本不在支持列表里（\(info.displayVersions.joined(separator: "、"))）。"
+                let failed = !damaged.isEmpty && damageNote == nil
+                    ? "游戏文件损坏（\(damaged.count) 个文件没通过校验：\(damaged.prefix(3).joined(separator: "、"))\(damaged.count > 3 ? " 等" : "")），请从你的 Switch 重新导出这份文件。"
+                    : "构建没有成功，请展开下面的日志查看原因。如果提示没有这个游戏或版本的档案，说明文件的版本不在支持列表里（\(info.displayVersions.joined(separator: "、"))）。"
                 guard status == 0 && built else { self.notice = failed; return }
                 switch target {
                 case .macApp:
-                    self.notice = "构建完成，可以启动《\(self.s.selected.displayName)》了。第一次启动要预热着色器，会慢一些。"
+                    self.notice = (damageNote.map { $0 + " " } ?? "") + "构建完成，可以启动《\(self.s.selected.displayName)》了。第一次启动要预热着色器，会慢一些。"
                 case .xcode:
-                    self.notice = nxXcodeNextSteps
+                    self.notice = (damageNote.map { $0 + " " } ?? "") + nxXcodeNextSteps
                     NSWorkspace.shared.open(URL(fileURLWithPath: workspace))
                 case .ipa:
                     self.notice = "IPA 已生成：\(ipa)。用 Sideloadly 或 AltStore 登录自己的 Apple ID 签名安装到 iPad；免费 Apple ID 的签名 7 天后过期，需要重新安装。"
