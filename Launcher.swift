@@ -172,7 +172,7 @@ final class Model: ObservableObject {
             if !isDemoMode { s.write(to: Paths.config) }
             if s.selected.backend != oldValue.selected.backend { refreshDeps() }   // each backend has its own list of requirements
             if s.network != oldValue.network { Model.autoTried.removeAll(); refreshDeps() }   // other download sources: worth another try
-            if s.showCovers != oldValue.showCovers { coverRequested.removeAll(); if !s.showCovers { covers = [:] } }
+            if s.showCovers != oldValue.showCovers { coverRequested.removeAll(); covers = [:]; if s.showCovers { preloadCovers() } }
         }
     }
     /// Folders of the selected game.
@@ -211,6 +211,7 @@ final class Model: ObservableObject {
         deps = Model.makeDeps(project: s.projectDir, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror)
         if !isDemoMode { refreshCatalog() }
         if !isDemoMode && !isSnapshot { probeNetwork() }
+        if !isDemoMode { preloadCovers() }   // a snapshot too: it only reads and downloads pictures
         if isDemoMode { demo() }
     }
 
@@ -786,23 +787,65 @@ extension Model {
     /// The game's picture: the built app's icon, else the icon nxnative extracted from the player's own file or the eShop icon.
     func cover(_ g: GameKind) -> NSImage? { appIcon(g) ?? covers[g.titleID] }
 
-    /// Loads the game's picture once: the extracted icon, else the cached eShop icon, else downloads it (256 px) into the cache.
-    func requestCover(_ g: GameKind) {
+    /// Where one game's picture can come from.
+    struct CoverJob {
+        let id: String
+        let work: URL, cached: URL
+        let remote: URL?   // nil when covers are off: only the icon extracted from the player's own file
+    }
+
+    /// Takes the game for loading (once per session); nil when it has a picture already or is being loaded.
+    func coverJob(_ g: GameKind) -> CoverJob? {
         let id = g.titleID
-        guard !isDemoMode, covers[id] == nil, !coverRequested.contains(id), appIcon(g) == nil else { return }
+        guard !isDemoMode, covers[id] == nil, !coverRequested.contains(id), appIcon(g) == nil else { return nil }
         coverRequested.insert(id)
-        let work = URL(fileURLWithPath: (s.settings(for: g).workDir as NSString).expandingTildeInPath)
-        let cached = Paths.covers.appendingPathComponent(id + ".jpg")
-        let remote = s.showCovers ? coverURLs[id].flatMap(URL.init(string:)) : nil
+        return CoverJob(id: id, work: URL(fileURLWithPath: (s.settings(for: g).workDir as NSString).expandingTildeInPath),
+                        cached: Paths.covers.appendingPathComponent(id + ".jpg"),
+                        remote: s.showCovers ? coverURLs[id].flatMap(URL.init(string:)) : nil)
+    }
+
+    /// The extracted icon, else the cached eShop icon: no network.
+    nonisolated static func localCover(_ j: CoverJob) -> NSImage? {
+        extractedIcon(workDir: j.work, titleID: j.id).flatMap(NSImage.init(contentsOf:)) ?? (j.remote == nil ? nil : NSImage(contentsOf: j.cached))
+    }
+
+    /// The eShop icon (about 1 MB, 1024 px: the CDN has no smaller size), kept as a 256 px JPEG in the cache.
+    nonisolated static func downloadCover(_ j: CoverJob) async -> NSImage? {
+        guard let remote = j.remote, let r = try? await URLSession.shared.data(from: remote), (r.1 as? HTTPURLResponse)?.statusCode == 200,
+              let small = thumbnailJPEG(r.0, side: 256), let img = NSImage(data: small) else { return nil }
+        try? FileManager.default.createDirectory(at: Paths.covers, withIntermediateDirectories: true)
+        try? small.write(to: j.cached, options: .atomic)
+        return img
+    }
+
+    /// One game, when its row appears (a game the preload has not reached yet, or one added since).
+    func requestCover(_ g: GameKind) {
+        guard let job = coverJob(g) else { return }
         Task.detached {
-            let local = extractedIcon(workDir: work, titleID: id).flatMap(NSImage.init(contentsOf:))
-                ?? (remote == nil ? nil : NSImage(contentsOf: cached))
-            if let local { await MainActor.run { self.covers[id] = local }; return }
-            guard let remote, let r = try? await URLSession.shared.data(from: remote), (r.1 as? HTTPURLResponse)?.statusCode == 200,
-                  let small = thumbnailJPEG(r.0, side: 256), let img = NSImage(data: small) else { return }
-            try? FileManager.default.createDirectory(at: Paths.covers, withIntermediateDirectories: true)
-            try? small.write(to: cached, options: .atomic)
-            await MainActor.run { self.covers[id] = img }
+            var img = Model.localCover(job)
+            if img == nil { img = await Model.downloadCover(job) }
+            if let img { await MainActor.run { self.covers[job.id] = img } }
+        }
+    }
+
+    /// Every game at start: what is on disk shows at once, then the missing ones download 8 at a time instead of one row at a time.
+    func preloadCovers() {
+        let jobs = GameKind.all.compactMap(coverJob)
+        guard !jobs.isEmpty else { return }
+        Task.detached {
+            var found: [String: NSImage] = [:], missing: [CoverJob] = []
+            for j in jobs { if let img = Model.localCover(j) { found[j.id] = img } else if j.remote != nil { missing.append(j) } }
+            let local = found
+            await MainActor.run { self.covers.merge(local) { $1 } }
+            await withTaskGroup(of: (String, NSImage?).self) { group in
+                var queue = missing[...]
+                func start() { if let j = queue.popFirst() { group.addTask { (j.id, await Model.downloadCover(j)) } } }
+                for _ in 0..<8 { start() }
+                for await (id, img) in group {
+                    if let img { await MainActor.run { self.covers[id] = img } }
+                    start()
+                }
+            }
         }
     }
 
