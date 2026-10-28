@@ -2178,9 +2178,19 @@ struct SettingsView: View {
 
 // MARK: - App
 
+/// Closing the window quits the launcher (a hidden copy kept running after an update would keep running the old code), except while
+/// a build or a start is in progress.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    @MainActor static weak var model: Model?
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        MainActor.assumeIsolated { AppDelegate.model.map { $0.busy == nil && !$0.launching } ?? true }
+    }
+}
+
 @main
 struct LauncherApp: App {
     @StateObject private var model = Model()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
         let args = CommandLine.arguments
@@ -2212,7 +2222,7 @@ struct LauncherApp: App {
 
     var body: some Scene {
         WindowGroup("sw-launcher") {
-            MainView(model: model).preferredColorScheme(.dark)
+            MainView(model: model).preferredColorScheme(.dark).onAppear { AppDelegate.model = model }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1240, height: 760)
