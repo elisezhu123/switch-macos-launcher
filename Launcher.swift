@@ -158,6 +158,7 @@ final class Model: ObservableObject {
         didSet {
             if !isDemoMode { s.write(to: Paths.config) }
             if s.selected.backend != oldValue.selected.backend { refreshDeps() }   // each backend has its own list of requirements
+            if s.network != oldValue.network { Model.autoTried.removeAll(); refreshDeps() }   // other download sources: worth another try
         }
     }
     /// Folders of the selected game.
@@ -174,6 +175,11 @@ final class Model: ObservableObject {
     @Published var shaderBaked = 0
     @Published var modList: [ModInfo] = []
     @Published var modWarnings: [String] = []
+    /// The system proxy, passed on to every installer and build (an app opened from Finder does not pass it by itself).
+    @Published var proxyEnv: [String: String] = [:]
+    /// Whether PyPI and GitHub answered quickly; probed once at start, before anything is installed automatically.
+    @Published var officialFast = true
+    @Published var netChecked = false
 
     static let initialTab: Int = {
         let a = CommandLine.arguments
@@ -181,8 +187,12 @@ final class Model: ObservableObject {
     }()
 
     init() {
-        deps = Model.makeDeps(project: s.projectDir, nxDir: s.nxDir, backend: s.selected.backend)
-        if !isDemoMode { refreshCatalog() }
+        if !isDemoMode {
+            let own = ProcessInfo.processInfo.environment.filter { ["http_proxy", "https_proxy", "all_proxy", "no_proxy"].contains($0.key.lowercased()) }
+            proxyEnv = systemProxyEnvironment(scutil: sh("/usr/sbin/scutil --proxy").out).merging(own) { $1 }
+        }
+        deps = Model.makeDeps(project: s.projectDir, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror)
+        if !isDemoMode { refreshCatalog(); probeNetwork() }
         if isDemoMode { demo() }
     }
 
@@ -197,14 +207,40 @@ final class Model: ObservableObject {
     /// Applied in this order on top of baseCommit: the Mac fixes of v1.0, then the BOTW port and RomFS mods (sw-port.patch).
     nonisolated static var patchPaths: [String] { ["totk-mac-fixes", "sw-port"].map { Bundle.main.path(forResource: $0, ofType: "patch") ?? "" } }
 
-    static func projectInstallCommand(_ project: String) -> String {
-        installCommand(project: project, baseCommit: baseCommit, patches: patchPaths)
+    static func projectInstallCommand(_ project: String, mirror: Bool = false) -> String {
+        installCommand(project: project, baseCommit: baseCommit, patches: patchPaths, mirror: mirror)
     }
 
-    static func makeDeps(project: String, nxDir: String, backend: Backend) -> [Dep] {
+    // MARK: network
+
+    var hasProxy: Bool { proxyEnv.keys.contains { $0.lowercased() != "no_proxy" } }
+    var mirror: Bool { useMirrors(s.network, proxy: hasProxy, officialFast: officialFast) }
+    var netEnv: [String: String] { networkEnvironment(mirror: mirror, proxy: proxyEnv) }
+    var netSummary: String {
+        let proxy = proxyEnv["https_proxy"] ?? proxyEnv["http_proxy"] ?? proxyEnv["all_proxy"]
+        let found = proxy.map { "检测到代理 \($0.replacingOccurrences(of: "http://", with: ""))" } ?? "没有检测到代理"
+        switch s.network {
+        case .direct: return found + "；按设置使用官方源"
+        case .mirror: return found + "；按设置使用国内镜像（清华 TUNA、中科大、ghfast）"
+        case .auto:
+            if !netChecked { return found + "；正在测试官方源速度…" }
+            if !hasProxy { return found + "，使用国内镜像（清华 TUNA、中科大、ghfast）" }
+            return officialFast ? found + "，官方源速度正常，使用官方源" : found + "，但官方源响应慢，改用国内镜像"
+        }
+    }
+
+    func probeNetwork() {
+        let env = proxyEnv
+        Task.detached {
+            let fast = sh(exportLine(env) + officialSourcesProbe()).status == 0
+            await MainActor.run { self.officialFast = fast; self.netChecked = true; self.refreshDeps() }
+        }
+    }
+
+    static func makeDeps(project: String, nxDir: String, backend: Backend, mirror: Bool = false) -> [Dep] {
         let clt = Dep(id: "clt", title: "Xcode 命令行工具", detail: "编译游戏运行时所需", size: "约 1 GB", required: true, install: .terminal("xcode-select --install"))
         let brew = Dep(id: "brew", title: "Homebrew", detail: backend == .macnative ? "安装 Python 和音视频库" : "安装 Python、.NET 和构建工具", size: nil, required: true,
-                       install: .terminal("/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""))
+                       install: .terminal(brewInstallCommand(mirror: mirror)))
         let python = Dep(id: "python", title: "Python 3.14", detail: "运行构建脚本", size: "约 60 MB", required: true, install: .background("/opt/homebrew/bin/brew install python@3.14"))
         let xcode = Dep(id: "xcode", title: "Xcode（完整版）", detail: backend == .macnative ? "下载 Metal Toolchain 需要" : "构建着色器和主程序需要；装好后打开一次", size: "约 7 GB", required: backend == .nxnative,
                         install: .link("macappstore://apps.apple.com/app/xcode/id497799835"))
@@ -215,9 +251,9 @@ final class Model: ObservableObject {
             return [
                 clt, brew, python,
                 Dep(id: "libs", title: "opus 与 libvpx", detail: "游戏音频和过场视频解码", size: "约 10 MB", required: true, install: .background("/opt/homebrew/bin/brew install opus libvpx")),
-                Dep(id: "project", title: "构建工具（MacNativeGames）", detail: project, size: "约 50 MB", required: true, install: .background(projectInstallCommand(project))),
+                Dep(id: "project", title: "构建工具（MacNativeGames）", detail: project, size: "约 50 MB", required: true, install: .background(projectInstallCommand(project, mirror: mirror))),
                 Dep(id: "patch", title: "Mac 兼容补丁与旷野之息移植", detail: "内存布局回退、并行预热、预编译着色器、语言设置；旷野之息移植和 Mods。已装过旧版构建工具时，点安装只补打缺少的补丁", size: nil, required: true,
-                    install: .background(upgradeCommand(project: project, fresh: project + "-sw-launcher", baseCommit: baseCommit, patches: Model.patchPaths))),
+                    install: .background(upgradeCommand(project: project, fresh: project + "-sw-launcher", baseCommit: baseCommit, patches: Model.patchPaths, mirror: mirror))),
                 xcode, metal,
                 Dep(id: "disk", title: "磁盘空间", detail: "构建需要约 25–40 GB 空闲", size: nil, required: true, install: .none),
             ]
@@ -233,7 +269,7 @@ final class Model: ObservableObject {
                     install: .terminal("/opt/homebrew/bin/brew install --cask dotnet-sdk")),
                 Dep(id: "nxvenv", title: "Python 组件（capstone、fonttools、lz4、nsz）", detail: "装进启动器自己的环境，不改动系统 Python", size: "约 30 MB", required: true,
                     install: .background(nxVenvCommand(venv: Paths.nxVenv.path))),
-                Dep(id: "nxrepo", title: "nxnative", detail: nxDir, size: "约 100 MB", required: true, install: .background(nxCloneCommand(dir: (nxDir as NSString).expandingTildeInPath))),
+                Dep(id: "nxrepo", title: "nxnative", detail: nxDir, size: "约 100 MB", required: true, install: .background(nxCloneCommand(dir: (nxDir as NSString).expandingTildeInPath, mirror: mirror))),
                 Dep(id: "disk", title: "磁盘空间", detail: "构建需要约游戏大小的两倍再加 10 GB 空闲", size: nil, required: true, install: .none),
             ]
         }
@@ -243,7 +279,12 @@ final class Model: ObservableObject {
         if isDemoMode { return }
         let project = s.projectDir, nxDir = (s.nxDir as NSString).expandingTildeInPath, venv = Paths.nxVenv.path
         let needGB = diskNeededGB
-        deps = Model.makeDeps(project: project, nxDir: s.nxDir, backend: s.selected.backend)
+        // A new list starts at "checking": keep what is installing right now, so it is not shown as missing and started twice.
+        let inFlight = Dictionary(uniqueKeysWithValues: deps.compactMap { d -> (String, Dep.State)? in
+            if case .installing = d.state { return (d.id, d.state) }; return nil
+        })
+        deps = Model.makeDeps(project: project, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror)
+        for i in deps.indices { if let st = inFlight[deps[i].id] { deps[i].state = st } }
         let ids = deps.map(\.id)
         Task.detached {
             var results: [String: Bool] = [:]
@@ -288,6 +329,11 @@ final class Model: ObservableObject {
     ]
     /// Requirements the auto-installer already started once this session: a failure is shown, not retried in a loop.
     private static var autoTried: Set<String> = []
+    /// Background installers running now: one per requirement, whatever starts it (auto, one-click, a click).
+    private static var running: Set<String> = []
+    /// One-click install: keep going through the list even when automatic installs are off.
+    private var forceAuto = false
+    private var watchingManual = false
 
     var installingDep: Dep? { deps.first { if case .installing = $0.state { return true }; return false } }
     /// Missing requirements only the player can install (they need a password, the App Store or a license to read).
@@ -300,7 +346,7 @@ final class Model: ObservableObject {
 
     /// One missing requirement at a time, in list order, once its prerequisites are installed. Each finished install checks again and continues.
     func autoInstallNext() {
-        guard s.autoInstall, !isDemoMode, busy == nil, installingDep == nil else { return }
+        guard s.autoInstall || forceAuto, netChecked, !isDemoMode, busy == nil, installingDep == nil else { return }
         let ok = Dictionary(uniqueKeysWithValues: deps.map { ($0.id, $0.state == .ok) })
         guard let next = deps.first(where: { d in
             guard d.required, d.state == .missing, !Model.autoTried.contains(d.id), case .background = d.install else { return false }
@@ -310,17 +356,65 @@ final class Model: ObservableObject {
         install(next.id)
     }
 
+    /// Everything missing at once: the password installers in one Terminal window (one password), the App Store for Xcode, and the
+    /// rest in the background, each as soon as what it needs is installed.
+    func installAll() {
+        Model.autoTried.removeAll()
+        for i in deps.indices { if case .failed = deps[i].state { deps[i].state = .missing } }
+        let ok = Dictionary(uniqueKeysWithValues: deps.map { ($0.id, $0.state == .ok) })
+        let missing = deps.filter { $0.required && $0.state == .missing }
+        var terminal: [String] = []
+        for d in missing {
+            switch d.install {
+            case .terminal(let c):
+                if d.id == "clt" && missing.contains(where: { $0.id == "brew" }) { continue }   // the Homebrew installer installs them itself
+                if d.id == "xcsel" && ok["xcode"] != true { continue }   // needs Xcode first; offered again once it is installed
+                terminal.append(c)
+            case .link(let u): if let url = URL(string: u) { NSWorkspace.shared.open(url) }
+            default: break
+            }
+        }
+        if !terminal.isEmpty {
+            openInTerminal(terminalInstallScript(terminal, exports: exportLine(netEnv)))
+            watchManualInstalls()
+        }
+        forceAuto = true
+        notice = terminal.isEmpty ? "正在后台安装缺少的组件…" : "需要密码的组件已在“终端”里开始安装（只输一次密码）；其余的在后台安装。"
+        autoInstallNext()
+    }
+
+    /// While a Terminal installer runs: check again every 15 s (for up to 30 minutes) until nothing waits on the player.
+    func watchManualInstalls() {
+        guard !watchingManual else { return }
+        watchingManual = true
+        Task {
+            for _ in 0..<120 {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                refreshDeps()
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if manualDeps.isEmpty { break }
+            }
+            watchingManual = false
+        }
+    }
+
     func install(_ id: String) {
         guard let idx = deps.firstIndex(where: { $0.id == id }) else { return }
         switch deps[idx].install {
-        case .terminal(let c): openInTerminal(c); notice = "已在“终端”里打开安装命令，装完后点“重新检查”。"
+        case .terminal(let c):
+            openInTerminal(terminalInstallScript([c], exports: exportLine(netEnv)))
+            notice = "已在“终端”里打开安装命令，装完后启动器会自动重新检查。"
+            watchManualInstalls()
         case .link(let u): if let url = URL(string: u) { NSWorkspace.shared.open(url) }
         case .none: break
         case .background(let cmd):
+            guard !Model.running.contains(id) else { return }
+            Model.running.insert(id)
             deps[idx].state = .installing(nil)
+            let env = netEnv
             Task {
                 var buffer = ""
-                let status = await runStreaming(cmd) { text in
+                let status = await runStreaming(cmd, env: env) { text in
                     Task { @MainActor in
                         buffer += text; self.log += text
                         if let m = lastMatch(#"\(([0-9.]+) (?:MB|KB) of ([0-9.]+) MB downloaded\)"#, in: text),
@@ -330,6 +424,7 @@ final class Model: ObservableObject {
                     }
                 }
                 await MainActor.run {
+                    Model.running.remove(id)
                     // The old build tool could not take the patches and a fresh one was installed next to it: use that one.
                     if status == 0, let m = lastMatch(NSRegularExpression.escapedPattern(for: freshToolMarker) + "(.+)", in: buffer) {
                         self.s.projectDir = m[1].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -544,7 +639,7 @@ final class Model: ObservableObject {
             func q(_ x: String) -> String { "'" + (x as NSString).expandingTildeInPath.replacingOccurrences(of: "'", with: "'\\''") + "'" }
             var cmd = "/opt/homebrew/bin/python3.14 build_app.py --title \(s.selected.buildTitleArg) \(q(s.game)) -k \(q(keys)) --firmware \(q(firmware)) --work \(q(s.workDir)) -o \(q(s.outputApp))"
             if !s.update.isEmpty { cmd += " --update \(q(s.update))" }
-            let status = await runStreaming(cmd, cwd: s.projectDir, env: ["PIP_DEFAULT_TIMEOUT": "180", "PIP_RETRIES": "10"]) { text in
+            let status = await runStreaming(cmd, cwd: s.projectDir, env: netEnv.merging(["PIP_DEFAULT_TIMEOUT": "180", "PIP_RETRIES": "10"]) { $1 }) { text in
                 Task { @MainActor in
                     self.log += text
                     if let m = lastMatch(#"(\d)/4 (\w+)"#, in: text), let n = Double(m[1]) {
@@ -806,7 +901,7 @@ extension Model {
             log += "构建文件夹：\(stage)\n" + files.map { "  \($0.lastPathComponent)\n" }.joined()
             let lines = LineBuffer()
             var totalStages = 0
-            let status = await runStreaming(nxBuildCommand(venv: Paths.nxVenv.path, stage: stage, keys: keys, app: output, target: target, teamID: teamID, workspace: workspace, freeAppleID: free), cwd: nxDir, env: Model.nxToolEnvironment) { text in
+            let status = await runStreaming(nxBuildCommand(venv: Paths.nxVenv.path, stage: stage, keys: keys, app: output, target: target, teamID: teamID, workspace: workspace, freeAppleID: free), cwd: nxDir, env: netEnv.merging(Model.nxToolEnvironment) { $1 }) { text in
                 let whole = lines.feed(text)
                 Task { @MainActor in for l in whole { totalStages = self.handleNXBuildLine(l, total: totalStages) } }
             }
@@ -900,7 +995,7 @@ extension Model {
         guard FileManager.default.fileExists(atPath: dir + "/.git") else { notice = "还没有安装 nxnative，请先在“环境”页安装。"; return }
         busy = "更新 nxnative"; log = ""
         Task {
-            let status = await runStreaming(nxUpdateCommand(dir: dir), env: Model.nxToolEnvironment) { text in Task { @MainActor in self.log += text } }
+            let status = await runStreaming(nxUpdateCommand(dir: dir, mirror: mirror), env: netEnv.merging(Model.nxToolEnvironment) { $1 }) { text in Task { @MainActor in self.log += text } }
             busy = nil
             refreshCatalog()
             notice = status == 0 ? "nxnative 已更新，游戏列表已刷新（共 \(GameCatalog.nx.count) 款）。已构建的 App 需要重新构建才会用上新版本。" : "更新没有成功，详情见日志。"
@@ -1500,6 +1595,12 @@ struct EnvCard: View {
                     Button("重试") { model.install(d.id) }.controlSize(.mini)
                 }
             }
+            if ready < required.count && !checking {
+                Button { model.installAll() } label: { Label("一键安装全部", systemImage: "arrow.down.circle.fill").frame(maxWidth: .infinity) }
+                    .buttonStyle(.borderedProminent).tint(accent).controlSize(.small)
+                    .help("需要密码的组件在一个“终端”窗口里依次安装（只输一次密码），Xcode 打开 App Store，其余的在后台安装")
+            }
+            Text(model.mirror ? "下载源：国内镜像" : "下载源：官方源").font(.system(size: 10.5)).foregroundStyle(.secondary).help(model.netSummary)
             Toggle("缺少的组件自动在后台安装", isOn: $model.s.autoInstall)
                 .toggleStyle(.checkbox).font(.system(size: 11))
                 .onChange(of: model.s.autoInstall) { if model.s.autoInstall { model.autoInstallNext() } }
@@ -1525,6 +1626,8 @@ struct GameDetail: View {
                     section("游戏文件") { files(g) }
                     section("共享文件（所有游戏通用）") { shared(g) }
                     section("构建目标") { targetPicker(g) }
+                    section("存档") { saves(g) }
+                    section("Mods") { mods(g) }
                 }
                 .padding(18)
             }
@@ -1537,6 +1640,8 @@ struct GameDetail: View {
             .background(Theme.panel.opacity(0.6))
         }
         .background(Theme.panel.opacity(0.35))
+        .onAppear { model.refreshMods() }
+        .onChange(of: model.s.selected) { model.refreshMods() }
     }
 
     func section<C: View>(_ title: String, @ViewBuilder _ c: () -> C) -> some View {
@@ -1604,6 +1709,54 @@ struct GameDetail: View {
         } else {
             Label("nxnative 不需要固件；游戏文件只做符号链接，不复制。", systemImage: "info.circle").font(.system(size: 11)).foregroundStyle(.secondary)
         }
+    }
+
+    // MARK: saves and mods
+
+    @ViewBuilder func saves(_ g: GameKind) -> some View {
+        FileSlot(title: "要导入的存档", hint: "存档文件夹", tag: .optional,
+                 path: model.s.save, check: model.check(.save), choose: { model.choose(.save) }, clear: { model.s.save = "" })
+        HStack(spacing: 8) {
+            Button { model.importSave() } label: { Label("导入到游戏", systemImage: "square.and.arrow.down") }
+                .disabled({ if case .ok = model.check(.save) { return false }; return true }())
+            Button { model.openFolder(model.paths.profileSave) } label: { Label("打开游戏存档", systemImage: "folder") }
+        }.controlSize(.small)
+        Text("导入前会自动备份现有存档。第一次要先启动一次游戏，让它创建存档目录。").font(.system(size: 11)).foregroundStyle(.secondary)
+    }
+
+    var modsCheck: Check {
+        if model.s.mods.isEmpty { return .empty }
+        if model.modList.isEmpty { return .bad("没有找到 mod（需要 <mod>/romfs/…）") }
+        let on = model.modList.filter { model.modEnabled($0.name) }.count
+        return .ok("\(model.modList.count) 个 mod，启用 \(on) 个")
+    }
+
+    @ViewBuilder func mods(_ g: GameKind) -> some View {
+        FileSlot(title: "Mods 文件夹", hint: "RomFS 替换，<mod>/romfs/…", tag: .optional, path: model.s.mods, check: modsCheck,
+                 choose: { if let p = model.pick(directory: true, title: "选择 Mods 文件夹") { model.s.mods = p; model.refreshMods() } },
+                 clear: { model.s.mods = ""; model.refreshMods() })
+        if !model.modList.isEmpty {
+            VStack(spacing: 0) {
+                ForEach(Array(model.modList.enumerated()), id: \.element.name) { i, m in
+                    HStack(spacing: 6) {
+                        Toggle("", isOn: Binding(get: { model.modEnabled(m.name) }, set: { model.setMod(m.name, enabled: $0) }))
+                            .labelsHidden().toggleStyle(.switch).controlSize(.mini).tint(accent)
+                        Text(m.name).font(.system(size: 12)).lineLimit(1)
+                        Spacer(minLength: 2)
+                        let c = model.modEnabled(m.name) ? model.conflictCount(m.name) : 0
+                        if c > 0 { Text("\(c) 冲突").font(.system(size: 10.5)).foregroundStyle(.orange) }
+                        Button { model.moveMod(m.name, by: -1) } label: { Image(systemName: "chevron.up") }.buttonStyle(.borderless).disabled(i == 0)
+                        Button { model.moveMod(m.name, by: 1) } label: { Image(systemName: "chevron.down") }.buttonStyle(.borderless).disabled(i == model.modList.count - 1)
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    if i < model.modList.count - 1 { Rectangle().fill(Theme.line).frame(height: 1) }
+                }
+            }
+            .background(Color.white.opacity(0.03), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.line))
+        }
+        Text(target == .macApp ? "多个 mod 改了同一个文件时，靠下的生效。下次启动时生效，不用重新构建。" : "Mods 只对 Mac App 生效，iPad / iPhone 构建不会带上。")
+            .font(.system(size: 11)).foregroundStyle(.secondary)
     }
 
     // MARK: build target
@@ -1675,7 +1828,6 @@ struct GameDetail: View {
 
     func footer(_ g: GameKind) -> some View {
         HStack(spacing: 12) {
-            Button("存档文件夹") { model.openFolder(model.paths.profileSave) }
             Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: (model.s.outputApp as NSString).expandingTildeInPath)]) }
                 .disabled(!model.appBuilt)
             Spacer()
@@ -1955,7 +2107,17 @@ struct SettingsView: View {
 
     var envTab: some View {
         pane {
-            HStack { Text("运行环境").font(.system(size: 13, weight: .semibold)); Spacer(); Button("重新检查") { model.refreshDeps() }.controlSize(.small) }
+            HStack {
+                Text("运行环境").font(.system(size: 13, weight: .semibold)); Spacer()
+                Button("一键安装全部") { model.installAll() }.controlSize(.small).disabled(model.deps.filter(\.required).allSatisfy { $0.state == .ok })
+                Button("重新检查") { model.refreshDeps() }.controlSize(.small)
+            }
+            HStack(spacing: 8) {
+                Text("下载源").font(.system(size: 12))
+                Picker("", selection: $model.s.network) { ForEach(NetworkMode.allCases, id: \.self) { Text($0.label).tag($0) } }.labelsHidden().frame(width: 320)
+            }
+            Text(model.netSummary + "。Homebrew、Python 组件、MacNativeGames 和 nxnative 会走所选的源；Xcode、Metal Toolchain 来自 Apple，.NET 来自微软。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
             Text(model.s.selected.backend == .nxnative ? "当前游戏用 nxnative 构建" : "当前游戏用 MacNativeGames 构建").font(.system(size: 11)).foregroundStyle(.secondary)
             ForEach(model.deps) { dep in DepRow(dep: dep) { model.install(dep.id) } }
             Text("打开“自动后台安装”时，不需要密码的组件会在前置条件就绪后自动安装；Homebrew、命令行工具、.NET 和 Xcode 设置需要密码，要你点“安装”在“终端”里运行。").font(.system(size: 11)).foregroundStyle(.secondary)

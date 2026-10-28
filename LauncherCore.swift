@@ -188,9 +188,11 @@ struct LauncherSettings: Codable {
     var nxWorkspace = ""
     /// Install the missing requirements in the background as soon as what they need is there (Homebrew packages, build tools, nxnative).
     var autoInstall = true
+    /// Download source for the installers and builds (official, or mirrors when no proxy is set).
+    var network: NetworkMode = .auto
     private var home: URL { FileManager.default.homeDirectoryForCurrentUser }
 
-    enum CodingKeys: String, CodingKey { case selected, games, keys, firmware, language, projectDir, nxDir, nxTarget, teamID, freeAppleID, nxWorkspace, autoInstall }
+    enum CodingKeys: String, CodingKey { case selected, games, keys, firmware, language, projectDir, nxDir, nxTarget, teamID, freeAppleID, nxWorkspace, autoInstall, network }
 
     init() {}
     /// Tolerant: a v1.1.0 file has no nxDir, and an unknown game id (a game removed from the catalog) is kept as it is.
@@ -204,6 +206,7 @@ struct LauncherSettings: Codable {
         nxTarget = (try? c.decodeIfPresent(NXTarget.self, forKey: .nxTarget)) ?? .macApp
         freeAppleID = (try? c.decodeIfPresent(Bool.self, forKey: .freeAppleID)) ?? true
         autoInstall = (try? c.decodeIfPresent(Bool.self, forKey: .autoInstall)) ?? true
+        network = (try? c.decodeIfPresent(NetworkMode.self, forKey: .network)) ?? .auto
     }
 
     static func fresh(home: URL) -> LauncherSettings {
@@ -222,7 +225,7 @@ struct LauncherSettings: Codable {
             if !read.projectDir.isEmpty { s.projectDir = read.projectDir }
             if !read.nxDir.isEmpty { s.nxDir = read.nxDir }
             s.nxTarget = read.nxTarget; s.teamID = read.teamID; s.freeAppleID = read.freeAppleID; s.nxWorkspace = read.nxWorkspace
-            s.autoInstall = read.autoInstall
+            s.autoInstall = read.autoInstall; s.network = read.network
             for (k, v) in read.games { s.games[k] = v }
             return s
         }
@@ -431,10 +434,13 @@ func runState(for game: GameKind, settings: LauncherSettings, home: URL) -> RunS
 func shQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
 /// A fresh build tool: the pinned upstream commit with every patch applied in order (stops if `project` is not empty).
-func installCommand(project: String, baseCommit: String, patches: [String]) -> String {
+let macNativeRepoURL = "https://github.com/ly05010419/MacNativeGames"
+
+/// The commit is fetched by its hash, so a mirror cannot hand over a different tree.
+func installCommand(project: String, baseCommit: String, patches: [String], mirror: Bool = false) -> String {
     let d = shQuote(project)
     return "set -e; if [ -e \(d) ] && [ -n \"$(ls -A \(d) 2>/dev/null)\" ]; then echo \"目录已存在且不是空的：\"\(d); exit 1; fi; " +
-        "mkdir -p \(d) && cd \(d) && git init -q && git remote add origin https://github.com/ly05010419/MacNativeGames && " +
+        "mkdir -p \(d) && cd \(d) && git init -q && git remote add origin \(githubURL(macNativeRepoURL, mirror: mirror)) && " +
         "git fetch --depth 1 origin \(baseCommit) && git checkout -q FETCH_HEAD" +
         patches.map { " && git apply -p1 \(shQuote($0))" }.joined()
 }
@@ -457,9 +463,9 @@ let freshToolMarker = "SW_FRESH_BUILD_TOOL="
 
 /// Applies the missing patches; when the existing build tool cannot take them (a v1.0.0 install, or a tree with its own
 /// changes), installs a fresh build tool into `fresh` instead and prints freshToolMarker + its path. Never resets `project`.
-func upgradeCommand(project: String, fresh: String, baseCommit: String, patches: [String]) -> String {
+func upgradeCommand(project: String, fresh: String, baseCommit: String, patches: [String], mirror: Bool = false) -> String {
     "( \(patchesCommand(project: project, patches: patches)) ) || ( echo '现有的构建工具无法打上补丁，改为安装一份新的：'\(shQuote(fresh)); " +
-        "\(installCommand(project: fresh, baseCommit: baseCommit, patches: patches)) && echo \(freshToolMarker)\(shQuote(fresh)) )"
+        "\(installCommand(project: fresh, baseCommit: baseCommit, patches: patches, mirror: mirror)) && echo \(freshToolMarker)\(shQuote(fresh)) )"
 }
 
 // MARK: - Start-up log
@@ -719,13 +725,111 @@ func nxToolPath(venv: String) -> String {
 
 let nxRepoURL = "https://github.com/seedds/nxnative.git"
 
-/// Shallow clone (stops if `dir` is not empty).
-func nxCloneCommand(dir: String) -> String {
+/// Shallow clone (stops if `dir` is not empty). Through a mirror, `origin` is set back to GitHub afterwards.
+func nxCloneCommand(dir: String, mirror: Bool = false) -> String {
     let d = shQuote(dir)
-    return "set -e; if [ -e \(d) ] && [ -n \"$(ls -A \(d) 2>/dev/null)\" ]; then echo \"目录已存在且不是空的：\"\(d); exit 1; fi; git clone --depth 1 \(nxRepoURL) \(d)"
+    return "set -e; if [ -e \(d) ] && [ -n \"$(ls -A \(d) 2>/dev/null)\" ]; then echo \"目录已存在且不是空的：\"\(d); exit 1; fi; git clone --depth 1 \(githubURL(nxRepoURL, mirror: mirror)) \(d)" +
+        (mirror ? " && git -C \(d) remote set-url origin \(nxRepoURL)" : "")
 }
 
-func nxUpdateCommand(dir: String) -> String { "git -C \(shQuote(dir)) pull --ff-only" }
+/// Through a mirror, pulls the mirror's copy of GitHub's default branch; `origin` stays GitHub.
+func nxUpdateCommand(dir: String, mirror: Bool = false) -> String {
+    "git -C \(shQuote(dir)) pull --ff-only" + (mirror ? " \(githubURL(nxRepoURL, mirror: true)) HEAD" : "")
+}
+
+// MARK: - Downloads: proxy detection and mirrors
+
+/// Where downloads come from. `auto`: the official sources behind a proxy, the mirrors in China without one.
+enum NetworkMode: String, Codable, CaseIterable {
+    case auto, direct, mirror
+    var label: String {
+        switch self {
+        case .auto: return "自动（没有代理、或官方源太慢时走国内镜像）"
+        case .direct: return "总是用官方源"
+        case .mirror: return "总是用国内镜像"
+        }
+    }
+}
+
+/// A proxy in the environment (http_proxy / https_proxy / all_proxy) or in the system network settings (`scutil --proxy`).
+func proxyConfigured(environment: [String: String], scutil: String) -> Bool {
+    if environment.contains(where: { ["http_proxy", "https_proxy", "all_proxy"].contains($0.key.lowercased()) && !$0.value.isEmpty }) { return true }
+    return ["HTTPEnable", "HTTPSEnable", "SOCKSEnable", "ProxyAutoConfigEnable"].contains { k in
+        scutil.range(of: "\\b\(k)\\s*:\\s*1\\b", options: .regularExpression) != nil
+    }
+}
+
+/// `auto` uses the mirrors without a proxy, and also behind one when the official sources did not answer in time (`officialFast`).
+func useMirrors(_ mode: NetworkMode, proxy: Bool, officialFast: Bool = true) -> Bool {
+    mode == .mirror || (mode == .auto && (!proxy || !officialFast))
+}
+
+/// The system proxy (`scutil --proxy`) as the variables curl, git, pip and Homebrew read: an app started from Finder passes
+/// no proxy to the commands it runs, so without these they connect directly.
+func systemProxyEnvironment(scutil: String) -> [String: String] {
+    func value(_ k: String) -> String? {
+        guard let r = scutil.range(of: "\\b\(k)\\s*:\\s*(\\S+)", options: .regularExpression) else { return nil }
+        return scutil[r].split(separator: ":", maxSplits: 1).last.map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+    var env: [String: String] = [:]
+    func set(_ name: String, _ url: String) { env[name] = url; env[name.uppercased()] = url }
+    if value("HTTPEnable") == "1", let h = value("HTTPProxy"), let p = value("HTTPPort") { set("http_proxy", "http://\(h):\(p)") }
+    if value("HTTPSEnable") == "1", let h = value("HTTPSProxy"), let p = value("HTTPSPort") { set("https_proxy", "http://\(h):\(p)") }
+    if value("SOCKSEnable") == "1", let h = value("SOCKSProxy"), let p = value("SOCKSPort") { set("all_proxy", "socks5h://\(h):\(p)") }
+    if !env.isEmpty { set("no_proxy", "localhost,127.0.0.1,::1") }
+    return env
+}
+
+/// Everything an installer or build gets: the proxy, the mirrors when they are used, and pip timeouts so a stalled download fails
+/// with a message instead of hanging.
+func networkEnvironment(mirror: Bool, proxy: [String: String]) -> [String: String] {
+    proxy.merging(mirrorEnvironment(mirror)) { $1 }.merging(["PIP_DEFAULT_TIMEOUT": "60", "PIP_RETRIES": "5"]) { $1 }
+}
+
+/// `curl` exit status 0 when PyPI and GitHub both answer within 4 s (through `proxy`).
+func officialSourcesProbe() -> String {
+    "curl -sfI -o /dev/null -m 4 https://pypi.org/simple/pip/ && curl -sfI -o /dev/null -m 4 https://github.com/"
+}
+
+/// Homebrew and PyPI: TUNA (Tsinghua); the Homebrew installer: USTC's copy of the official script; git clones: a GitHub proxy.
+enum Mirrors {
+    static let pypi = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    static let github = "https://ghfast.top/"
+    static let brewInstaller = "https://mirrors.ustc.edu.cn/misc/brew-install.sh"
+    static let environment: [String: String] = [
+        "HOMEBREW_API_DOMAIN": "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api",
+        "HOMEBREW_BOTTLE_DOMAIN": "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles",
+        "HOMEBREW_BREW_GIT_REMOTE": "https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/brew.git",
+        "HOMEBREW_CORE_GIT_REMOTE": "https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/homebrew-core.git",
+        "HOMEBREW_PIP_INDEX_URL": pypi,
+        "PIP_INDEX_URL": pypi,
+    ]
+}
+
+func mirrorEnvironment(_ on: Bool) -> [String: String] { on ? Mirrors.environment : [:] }
+
+/// `export K='v'; …` in a fixed order, to put in front of a shell command (empty for the official sources).
+func mirrorExports(_ on: Bool) -> String { exportLine(mirrorEnvironment(on)) }
+
+func exportLine(_ env: [String: String]) -> String {
+    env.sorted { $0.key < $1.key }.map { "export \($0.key)=\(shQuote($0.value)); " }.joined()
+}
+
+func githubURL(_ url: String, mirror: Bool) -> String { mirror ? Mirrors.github + url : url }
+
+/// Homebrew's installer, without its "press RETURN" prompt (the password is asked for once, by terminalInstallScript).
+func brewInstallCommand(mirror: Bool) -> String {
+    let script = mirror ? Mirrors.brewInstaller : "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+    return "NONINTERACTIVE=1 /bin/bash -c \"$(curl -fsSL \(script))\""
+}
+
+/// One Terminal script for the installers that need the player's password: asks for it once (sudo -v, kept fresh while the
+/// installers run), runs them in order (one failing does not stop the next), then says the launcher will check again.
+func terminalInstallScript(_ commands: [String], exports: String = "") -> String {
+    "{ \(exports)sudo -v; ( while true; do sudo -n true; sleep 50; done ) 2>/dev/null & KEEP=$!; " +
+        commands.joined(separator: "; ") +
+        "; kill $KEEP 2>/dev/null; echo; echo '完成。可以关闭这个窗口，启动器会自动重新检查。'; }"
+}
 
 /// A Python environment of its own for nxnative's build scripts (no change to the system Python).
 func nxVenvCommand(venv: String, python: String = "/opt/homebrew/bin/python3.14") -> String {
