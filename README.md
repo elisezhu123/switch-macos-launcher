@@ -14,7 +14,7 @@
 > - **MacNativeGames**：《塞尔达传说 王国之泪》（1.0.0 / 1.1.2 / 1.4.3）和《旷野之息》（1.9.0，实验性）。保留原有的多线程着色器预热、预编译烘焙和 RomFS Mods。
 > - **nxnative**（[seedds/nxnative](https://github.com/seedds/nxnative)，见 [AppleGamingWiki 教程](https://www.applegamingwiki.com/wiki/Nxnative_Switch_to_Mac_conversion)）：**69 款游戏**，每款按它的档案支持对应版本，例如《超级马力欧兄弟 惊奇》1.0.0 / 1.0.1 / 1.2.1、《路易吉洋馆3》1.4.0、《火焰纹章 Engage》2.0.0、《怪物猎人 崛起》16.0.2。完整列表在启动器的游戏库里，装好 nxnative 后点“更新 nxnative 与游戏列表”还会自动读到它新增的游戏和版本。
 >
-> v1.2.0 加入 nxnative 后端。旧版设置自动沿用，已经构建好的 App 不用重新构建。
+> v1.2.0 加入 nxnative 后端；v1.4.0 重做主窗口（分类、游戏详情面板），缺少的组件自动后台安装，并换了新图标。旧版设置自动沿用，已经构建好的 App 不用重新构建。
 
 ### 重要声明（请务必阅读）
 
@@ -35,11 +35,11 @@
 
 ### 功能
 
-- **游戏库界面**：深色、工具栏（启动 / 构建 / 导入存档 / 日志）、搜索、列表 / 网格、底部状态栏；游戏库里有王国之泪和旷野之息两个条目，选中哪个，构建、启动、存档、日志和设置就针对哪个；支持把 `.xci` / `.nsp` 直接拖进窗口（文件名里带游戏 ID 时会自动选中对应的游戏）。
+- **游戏库界面**（v1.4.0 重做）：左侧按“全部 / 已添加 / 可启动”和引擎（MacNativeGames、nxnative）分类；中间列表只显示名称、引擎、版本和状态；右侧是选中游戏的详情——**选择版本**（据此判断要不要更新包，并检查更新包版本是否对得上）、**点击添加**游戏本体 / 更新包 / DLC / prod.keys / 固件、**选择构建目标**（Mac / iPad·iPhone Xcode 工程 / IPA），构建和启动按钮固定在底部。也支持把文件直接拖进窗口（文件名里带游戏 ID 时会自动选中对应的游戏和版本）。
 - **两款游戏互不干扰**：存档、着色器缓存、日志分别放在 `~/Library/Application Support/MacNativeGames/<TOTK|BOTW>/` 和 `~/Library/Logs/MacNativeGames/<totk|botw>.log`。同一时间只能运行一款；另一款在运行时，启动器会提示，不会去关掉它。
 - **Mods**：支持替换游戏文件的 RomFS mod，见下文。
 - **系统检测**：macOS 版本、芯片（M1–M5 系列）、内存、Metal 3 / Metal 4；顶部和状态栏明确写出 **macOS 26+、Metal 4** 的要求，不满足时给出"不支持"。
-- **环境检查与后台安装**：检查 Xcode 命令行工具、Homebrew、Python 3.14、opus / libvpx、构建工具、**Metal Toolchain（839 MB）**、磁盘空间；缺什么就给"安装"按钮，后台下载并显示进度。每一项都要你点击才会执行。
+- **环境检查与后台安装**：检查 Xcode 命令行工具、Homebrew、Python 3.14、opus / libvpx、构建工具、**Metal Toolchain（839 MB）**、磁盘空间；缺什么就后台下载并显示进度。v1.4.0 起默认**自动在后台安装**不需要密码的组件（按顺序、前置条件就绪后逐个安装，失败不自动重试，左下角可关闭）；Homebrew、命令行工具、.NET、Xcode 需要密码或 App Store，列在左下角，点“安装”在“终端”里运行。
 - **语言**：12 种，**默认简体中文**。游戏本体自带简体 / 繁体等文本，不需要额外的汉化补丁。
 - **存档**：选择存档文件夹后一键导入，**覆盖前自动备份**。
 - **构建**：调用 MacNativeGames 的构建脚本，显示 4 步进度；自动准备一份清理过的 `prod.keys` 副本（去掉会让 hactool 报错的行，原文件不动）。
@@ -155,7 +155,7 @@ It is **derived from [MacNativeGames](https://github.com/ly05010419/MacNativeGam
 
 > **No game content is included.** The game file (XCI/NSP), `prod.keys` and firmware must be obtained **by you, from your own Switch**. **Do not distribute or sell** them or any app built from them — **personal use only.** Not affiliated with Nintendo.
 
-**Features**: game-library window (drag & drop `.xci`/`.nsp`), system detection (macOS 26+, Metal 4, M-series, RAM), environment check with background installers (including the 839 MB Metal Toolchain), 12 game languages (Simplified Chinese by default), save import with automatic backup, build progress, and automatic retry when the game fails to reserve its address space.
+**Features**: game-library window, redesigned in v1.4.0 (sidebar categories by status and backend, a detail pane to pick the version, add files by clicking, choose Mac / iPad·iPhone / IPA and build or start; drag & drop `.xci`/`.nsp` still works), background auto-install of missing requirements that need no password (on by default), system detection (macOS 26+, Metal 4, M-series, RAM), environment check with background installers (including the 839 MB Metal Toolchain), 12 game languages (Simplified Chinese by default), save import with automatic backup, build progress, and automatic retry when the game fails to reserve its address space.
 
 **Patch (`totk-mac-fixes.patch`, 5 files, against upstream commit `41e1e0c`)**: multi-threaded shader pre-warming (6 threads by default, `TOTK_WARM_THREADS`), a persistent precompiled shader cache (`.metallib` files that other Metal apps cannot evict), a memory-layout fallback for Macs where the default fixed addresses cannot be reserved, a `language.txt` setting, and (v1.0.1) **starting in native 2560×1440 by default** (`TOTK_OUTPUT_RES=auto` restores the upstream 1080p start).
 

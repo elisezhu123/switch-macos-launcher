@@ -2021,7 +2021,7 @@ struct SettingsView: View {
                 IconView(image: model.appIcon, size: 64)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("sw-launcher").font(.system(size: 18, weight: .bold))
-                    Text("版本 1.3.0 · \(GameKind.all.count) 款游戏：MacNativeGames 2 款（王国之泪、旷野之息），nxnative \(GameCatalog.nx.count) 款 · Apple 芯片").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text("版本 1.4.0 · \(GameKind.all.count) 款游戏：MacNativeGames 2 款（王国之泪、旷野之息），nxnative \(GameCatalog.nx.count) 款 · Apple 芯片").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }
             Text("这个启动器只负责检测环境、调用构建脚本、导入存档、管理 Mods 和启动游戏。游戏本体、密钥和固件都必须是你自己的，启动器不包含任何游戏内容。").font(.system(size: 12)).foregroundStyle(.secondary)
