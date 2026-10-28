@@ -47,6 +47,32 @@ func testAutoInstallSettingRoundTrip() {
     expect(!r.autoInstall && r.current.version == "1.1.2", "round trip")
 }
 
+func testProxyDetectionAndMirrors() {
+    let off = "<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 0\n  SOCKSEnable : 0\n}"
+    let on = "<dictionary> {\n  HTTPEnable : 1\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n}"
+    expect(!proxyConfigured(environment: [:], scutil: off), "no proxy")
+    expect(proxyConfigured(environment: [:], scutil: on), "system proxy")
+    expect(proxyConfigured(environment: ["HTTPS_PROXY": "http://127.0.0.1:7890"], scutil: off), "proxy in the environment")
+    expect(!proxyConfigured(environment: ["HTTPS_PROXY": ""], scutil: off), "an empty variable is no proxy")
+    expect(useMirrors(.auto, proxy: false) && !useMirrors(.auto, proxy: true) && useMirrors(.mirror, proxy: true) && !useMirrors(.direct, proxy: false), "modes")
+    expect(mirrorExports(false).isEmpty && mirrorExports(true).contains("export PIP_INDEX_URL='https://pypi.tuna.tsinghua.edu.cn/simple'; "), "exports")
+    expect(installCommand(project: "/p", baseCommit: "abc", patches: [], mirror: true).contains("origin https://ghfast.top/https://github.com/ly05010419/MacNativeGames") &&
+           installCommand(project: "/p", baseCommit: "abc", patches: []).contains("origin https://github.com/ly05010419/MacNativeGames &&"), "MacNativeGames source")
+    let clone = nxCloneCommand(dir: "/n", mirror: true)
+    expect(clone.contains("clone --depth 1 https://ghfast.top/https://github.com/seedds/nxnative.git") && clone.hasSuffix("remote set-url origin https://github.com/seedds/nxnative.git"), "nxnative clone through the mirror")
+    expect(nxUpdateCommand(dir: "/n") == "git -C '/n' pull --ff-only" && nxUpdateCommand(dir: "/n", mirror: true).hasSuffix("nxnative.git HEAD"), "update")
+    expect(brewInstallCommand(mirror: true).contains("mirrors.ustc.edu.cn") && brewInstallCommand(mirror: false).contains("raw.githubusercontent.com"), "Homebrew installer")
+    let sc = "<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : 6152\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n  HTTPSPort : 6152\n  HTTPSProxy : 127.0.0.1\n  SOCKSEnable : 0\n}"
+    let pe = systemProxyEnvironment(scutil: sc)
+    expect(pe["https_proxy"] == "http://127.0.0.1:6152" && pe["HTTP_PROXY"] == "http://127.0.0.1:6152" && pe["all_proxy"] == nil, "system proxy for child processes: \(pe)")
+    expect(systemProxyEnvironment(scutil: off).isEmpty, "no proxy, no variables")
+    let ne = networkEnvironment(mirror: true, proxy: pe)
+    expect(ne["PIP_INDEX_URL"] == Mirrors.pypi && ne["https_proxy"] != nil && ne["PIP_DEFAULT_TIMEOUT"] == "60", "mirror + proxy + pip timeout")
+    expect(useMirrors(.auto, proxy: true, officialFast: false) && !useMirrors(.direct, proxy: true, officialFast: false), "slow official sources")
+    let script = terminalInstallScript(["a", "b"])
+    expect(script.hasPrefix("{ sudo -v;") && script.contains("a; b; kill $KEEP"), "one password, then each installer: \(script)")
+}
+
 func testGameKindIsAPlainStringInJSON() {
     let data = try! JSONEncoder().encode(["k": GameKind.totk, "n": GameKind.nx("0100152000022000")])
     let text = String(decoding: data, as: UTF8.self)
@@ -315,7 +341,7 @@ func testRunningNxGameIsFoundByItsHost() {
 }
 
 let nxTests: [(String, () -> Void)] = [
-    ("testVersionSelection", testVersionSelection), ("testAutoInstallSettingRoundTrip", testAutoInstallSettingRoundTrip),
+    ("testProxyDetectionAndMirrors", testProxyDetectionAndMirrors), ("testVersionSelection", testVersionSelection), ("testAutoInstallSettingRoundTrip", testAutoInstallSettingRoundTrip),
     ("testCatalogHasAllNxnativeGames", testCatalogHasAllNxnativeGames), ("testGameKindIsAPlainStringInJSON", testGameKindIsAPlainStringInJSON),
     ("testNxPathsFollowTheMacApp", testNxPathsFollowTheMacApp), ("testNxDefaultsAndNames", testNxDefaultsAndNames),
     ("testV110SettingsFileStillLoads", testV110SettingsFileStillLoads), ("testNxChoicesRoundTrip", testNxChoicesRoundTrip),
