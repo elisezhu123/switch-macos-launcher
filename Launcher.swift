@@ -276,8 +276,38 @@ final class Model: ObservableObject {
                     if case .installing = self.deps[i].state { continue }
                     self.deps[i].state = final[self.deps[i].id] == true ? .ok : .missing
                 }
+                self.autoInstallNext()
             }
         }
+    }
+
+    /// What a background installer needs installed first (Homebrew for its packages, Python for the environments, Xcode for the Metal Toolchain).
+    static let prerequisites: [String: [String]] = [
+        "python": ["brew"], "libs": ["brew"], "nxtools": ["brew"], "project": ["python", "clt"], "patch": ["project"],
+        "nxvenv": ["python"], "nxrepo": ["clt"], "metal": ["xcode"],
+    ]
+    /// Requirements the auto-installer already started once this session: a failure is shown, not retried in a loop.
+    private static var autoTried: Set<String> = []
+
+    var installingDep: Dep? { deps.first { if case .installing = $0.state { return true }; return false } }
+    /// Missing requirements only the player can install (they need a password, the App Store or a license to read).
+    var manualDeps: [Dep] {
+        deps.filter { d in
+            guard d.required, d.state == .missing else { return false }
+            if case .terminal = d.install { return true }; if case .link = d.install { return true }; return false
+        }
+    }
+
+    /// One missing requirement at a time, in list order, once its prerequisites are installed. Each finished install checks again and continues.
+    func autoInstallNext() {
+        guard s.autoInstall, !isDemoMode, busy == nil, installingDep == nil else { return }
+        let ok = Dictionary(uniqueKeysWithValues: deps.map { ($0.id, $0.state == .ok) })
+        guard let next = deps.first(where: { d in
+            guard d.required, d.state == .missing, !Model.autoTried.contains(d.id), case .background = d.install else { return false }
+            return (Model.prerequisites[d.id] ?? []).allSatisfy { ok[$0] ?? true }
+        }) else { return }
+        Model.autoTried.insert(next.id)
+        install(next.id)
     }
 
     func install(_ id: String) {
@@ -344,7 +374,10 @@ final class Model: ObservableObject {
             guard fm.fileExists(atPath: p) else { return .bad("找不到这个文件") }
             if let info = s.selected.nxInfo { return checkNXFile(p, info: info, update: true) }
             if s.selected == .botw { return ext == "nsp" ? .ok(sizeText(p)) : .bad("旷野之息需要 1.9.0 更新的 .nsp 文件") }
-            return ["nsp", "nsz"].contains(ext) ? .ok(sizeText(p)) : .bad("更新包应为 .nsp 或 .nsz")
+            guard ["nsp", "nsz"].contains(ext) else { return .bad("更新包应为 .nsp 或 .nsz") }
+            if !needsUpdate { return .bad("选的是 1.0.0（本体），不需要更新包；要用它请改选对应版本") }
+            if let v = updateVersion(s.selected, fileName: (p as NSString).lastPathComponent), v != version { return .bad("这是 \(v) 的更新包，所选版本是 \(version)") }
+            return .ok(sizeText(p))
         case .dlc:
             guard !s.dlc.isEmpty else { return .empty }
             var isDir: ObjCBool = false
@@ -385,7 +418,10 @@ final class Model: ObservableObject {
         let tag = versionTag(inFileName: name)
         if update {
             guard let tag else { return .bad("文件名里要有 [v版本号]（例如 [v\(info.package.dropFirst())]），否则 nxnative 不认这个更新") }
-            if let shown = info.build(forTag: tag) { return .ok("版本 \(shown)  ·  \(sizeText(p))") }
+            if let shown = info.build(forTag: tag) {
+                if !needsUpdate { return .bad("所选版本 \(version) 是本体，不需要更新包；这个更新包是 \(shown)") }
+                return shown == version ? .ok("版本 \(shown)  ·  \(sizeText(p))") : .bad("这是 \(shown) 的更新包，所选版本是 \(version)")
+            }
             return .bad("版本 v\(tag) 不在支持列表里（支持：\(info.displayVersions.joined(separator: "、"))）")
         }
         if let tag, tag != 0 { return .bad("文件名里的 [v\(tag)] 说明这是更新包，请放到“更新包”那一栏") }
@@ -406,15 +442,15 @@ final class Model: ObservableObject {
 
     var depsOK: Bool { deps.filter(\.required).allSatisfy { $0.state == .ok } }
     var verdict: Verdict { Verdict.of(info, backend: s.selected.backend) }
-    /// An nxnative game whose profile has no base-only build (v0) cannot be built without its update.
-    var nxNeedsUpdate: Bool { s.selected.nxInfo.map { info in !info.builds.contains { $0.version == "v0" } } ?? false }
+    /// The version the selected game is built at, and whether that needs an update file.
+    var version: String { selectedVersion(s.selected, settings: s.current) }
+    var needsUpdate: Bool { versionNeedsUpdate(s.selected, version: version) }
     var appBuilt: Bool { appBuilt(s.selected) }
     func appBuilt(_ g: GameKind) -> Bool {
         if isDemoMode { return g == .totk }
         let app = s.settings(for: g).outputApp as NSString
         return app.length > 0 && FileManager.default.fileExists(atPath: app.expandingTildeInPath + "/Contents/MacOS/" + g.executable)
     }
-    static let botwNeedsUpdate = "旷野之息需要 1.9.0 更新文件"
 
     var blockers: [String] {
         var out: [String] = []
@@ -422,8 +458,8 @@ final class Model: ObservableObject {
         if case .ok = check(.game) {} else { out.append("游戏本体") }
         if case .ok = check(.keys) {} else { out.append("prod.keys") }
         if s.selected.backend == .macnative, case .ok = check(.firmware) {} else if s.selected.backend == .macnative { out.append("固件") }
-        if s.selected == .botw, case .ok = check(.update) {} else if s.selected == .botw { out.append(Model.botwNeedsUpdate) }
-        if nxNeedsUpdate, case .ok = check(.update) {} else if nxNeedsUpdate { out.append("更新包（\(s.selected.nxInfo?.packageDisplay ?? "")）") }
+        if needsUpdate, case .ok = check(.update) {} else if needsUpdate { out.append("\(version) 更新包") }
+        if !needsUpdate, !s.update.isEmpty { out.append("移除更新包（所选版本是本体）") }
         if s.selected.backend == .nxnative, !s.dlc.isEmpty, case .bad = check(.dlc) { out.append("DLC 文件夹") }
         for d in deps where d.required && d.state != .ok { out.append(d.title) }
         return out
@@ -616,20 +652,12 @@ extension Model {
                      size: size, path: gs.game.isEmpty ? "还没有选择游戏文件" : gamePath, status: status)
     }
 
+    /// A built nxnative app carries the packed version in its Info.plist; otherwise the version chosen for the next build.
     func gameVersion(_ g: GameKind) -> String {
-        if let info = g.nxInfo {   // a built app carries the packed version in its Info.plist; before that, the version nxnative packs by default
-            let plist = (s.settings(for: g).outputApp as NSString).expandingTildeInPath + "/Contents/Info.plist"
-            if appBuilt(g), let d = NSDictionary(contentsOfFile: plist), let v = d["CFBundleShortVersionString"] as? String { return v }
-            return info.packageDisplay
-        }
-        if g == .botw { return "1.9.0" }
-        let gs = s.games[g.rawValue] ?? GameSettings()
-        let u = (gs.update as NSString).lastPathComponent
-        if u.contains("1.4.3") || u.contains("720896") { return "1.4.3" }
-        if u.contains("1.1.2") || u.contains("65536") { return "1.1.2" }
-        let plist = (gs.outputApp as NSString).expandingTildeInPath + "/Contents/Info.plist"
-        if let d = NSDictionary(contentsOfFile: plist), let v = d["CFBundleShortVersionString"] as? String { return v }
-        return "1.0.0"
+        let gs = s.settings(for: g)
+        if g.backend == .nxnative, appBuilt(g), let d = NSDictionary(contentsOfFile: (gs.outputApp as NSString).expandingTildeInPath + "/Contents/Info.plist"),
+           let v = d["CFBundleShortVersionString"] as? String { return v }
+        return selectedVersion(g, settings: gs)
     }
 
     var appIcon: NSImage? { appIcon(s.selected) }
@@ -719,13 +747,32 @@ extension Model {
         guard nxGameExtensions.contains(ext) else { return }
         if let (game, isUpdate) = gameForFileName(name, current: s.selected) {
             s.selected = game
-            if isUpdate { s.update = url.path } else { s.game = url.path }
+            if isUpdate { setUpdate(url.path) } else { s.game = url.path }
             return
         }
         // No known title ID in the name: the old rules for the selected game.
-        if s.selected.backend == .nxnative { if s.game.isEmpty { s.game = url.path } else { s.update = url.path } }
+        if s.selected.backend == .nxnative { if s.game.isEmpty { s.game = url.path } else { setUpdate(url.path) } }
         else if ext == "xci" || ext == "nsp" { s.game = url.path }
-        else if ext == "nsz" { s.update = url.path }
+        else if ext == "nsz" { setUpdate(url.path) }
+    }
+
+    /// A new update file also selects the version it brings the game to.
+    func setUpdate(_ path: String) {
+        s.update = path
+        if let v = updateVersion(s.selected, fileName: (path as NSString).lastPathComponent), s.selected.supportedVersions.contains(v) { s.current.version = v }
+    }
+
+    /// The Finder panel for one of the selected game's files (or the shared prod.keys / firmware).
+    func choose(_ f: Field) {
+        let nx = s.selected.backend == .nxnative
+        switch f {
+        case .game: if let p = pick(directory: false, extensions: nx ? ["nsp", "xci", "nsz", "xcz"] : ["xci", "nsp"], title: "选择游戏本体") { s.game = p }
+        case .update: if let p = pick(directory: false, extensions: ["nsp", "nsz"], title: "选择 \(version) 更新包") { setUpdate(p) }
+        case .dlc: if let p = pick(directory: true, title: "选择放 DLC 文件的文件夹") { s.dlc = p }
+        case .keys: if let p = pick(directory: false, extensions: ["keys"], title: "选择 prod.keys") { s.keys = p }
+        case .firmware: if let p = pick(directory: true, extensions: ["zip"], title: "选择固件（文件夹或 .zip）") { s.firmware = p }
+        case .save: if let p = pick(directory: true, title: "选择存档文件夹") { s.save = p }
+        }
     }
 }
 
@@ -1007,16 +1054,125 @@ struct ToolButton: View {
 
 // MARK: - Main window (game library)
 
-enum LibraryFilter: String, CaseIterable, Identifiable {
-    case all = "全部", added = "已添加", ready = "可启动"
-    var id: String { rawValue }
+/// The sidebar: the whole library, what the player added or can start, and each backend's games.
+enum LibraryCategory: Hashable {
+    case all, added, ready, backend(Backend)
+    var title: String {
+        switch self {
+        case .all: return "全部游戏"
+        case .added: return "已添加"
+        case .ready: return "可启动"
+        case .backend(let b): return b.title
+        }
+    }
+    var icon: String {
+        switch self {
+        case .all: return "square.stack.3d.up"
+        case .added: return "tray.full"
+        case .ready: return "play.circle"
+        case .backend(.macnative): return "leaf"
+        case .backend(.nxnative): return "cube.transparent"
+        }
+    }
+    func contains(_ e: Model.Entry) -> Bool {
+        switch self {
+        case .all: return true
+        case .added: return e.status != .notAdded
+        case .ready: return e.status == .built
+        case .backend(let b): return e.kind.backend == b
+        }
+    }
+}
+
+extension Backend {
+    var title: String { self == .nxnative ? "nxnative" : "MacNativeGames" }
+}
+
+struct BackendBadge: View {
+    let backend: Backend
+    var body: some View {
+        Text(backend.title).font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(backend == .nxnative ? Color(red: 0.55, green: 0.65, blue: 1.0) : accent)
+            .padding(.horizontal, 7).padding(.vertical, 2)
+            .background((backend == .nxnative ? Color(red: 0.4, green: 0.5, blue: 1.0) : accent).opacity(0.14), in: Capsule())
+    }
+}
+
+/// A row of buttons that act like a segmented control; an option can be disabled on its own.
+struct SegmentPicker<T: Hashable>: View {
+    struct Option { let value: T; let label: String; var icon: String? = nil; var enabled = true }
+    let options: [Option]
+    @Binding var selection: T
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(options.indices, id: \.self) { i in
+                let o = options[i], on = selection == o.value
+                Button { selection = o.value } label: {
+                    HStack(spacing: 5) {
+                        if let icon = o.icon { Image(systemName: icon) }
+                        Text(o.label).lineLimit(1)
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .frame(maxWidth: .infinity).padding(.vertical, 6)
+                    .foregroundStyle(o.enabled ? (on ? Color.white : Color.primary) : Color.secondary.opacity(0.45))
+                    .background(on ? accent : Color.clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).disabled(!o.enabled)
+            }
+        }
+        .padding(3)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+}
+
+/// One file of the selected game: click to choose it in Finder, × to remove it.
+struct FileSlot: View {
+    let title: String, hint: String
+    let tag: TagView.Kind
+    let path: String
+    let check: Check
+    let choose: () -> Void
+    let clear: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        let name = (path as NSString).lastPathComponent
+        let (icon, color, line): (String, Color, String) = switch check {
+        case .empty: ("plus.circle.fill", accent, "点击添加 · " + hint)
+        case .ok(let t): ("checkmark.circle.fill", accent, name + "  ·  " + t)
+        case .bad(let t): ("exclamationmark.triangle.fill", .orange, (path.isEmpty ? "" : name + "：") + t)
+        }
+        return Button(action: choose) {
+            HStack(spacing: 10) {
+                Image(systemName: icon).font(.system(size: 15)).foregroundStyle(color).frame(width: 20)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) { Text(title).font(.system(size: 12.5, weight: .medium)); TagView(kind: tag) }
+                    Text(line).font(.system(size: 11)).foregroundStyle({ if case .bad = check { return Color.orange }; return Color.secondary }())
+                        .lineLimit(2).truncationMode(.middle)
+                }
+                Spacer(minLength: 4)
+                if !path.isEmpty {
+                    Button(action: clear) { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain).help("移除")
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 9)
+            .background(hover ? Color.white.opacity(0.07) : Color.white.opacity(path.isEmpty ? 0.02 : 0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(path.isEmpty ? Color.white.opacity(0.18) : Theme.line, style: StrokeStyle(lineWidth: 1, dash: path.isEmpty ? [5, 4] : [])))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+        .help(path.isEmpty ? "点击选择文件，也可以直接把文件拖进窗口" : path)
+    }
 }
 
 struct MainView: View {
     @ObservedObject var model: Model
     var snapshot = false
     @State private var query = ""
-    @State private var filter = LibraryFilter.all
+    @State private var category = LibraryCategory.all
     @State private var grid = false
     @State private var showLog = false
 
@@ -1024,14 +1180,19 @@ struct MainView: View {
         VStack(spacing: 0) {
             toolbar
             Rectangle().fill(Theme.line).frame(height: 1)
-            if !model.blockers.isEmpty && !model.s.game.isEmpty && !model.appBuilt { warningBar }
-            library
+            HStack(spacing: 0) {
+                sidebar.frame(width: 214)
+                Rectangle().fill(Theme.line).frame(width: 1)
+                library
+                Rectangle().fill(Theme.line).frame(width: 1)
+                GameDetail(model: model).frame(width: 372)
+            }
             if showLog { logDrawer }
             statusBar
         }
         .ignoresSafeArea(edges: .top)
-        .frame(width: snapshot ? 1000 : nil, height: snapshot ? 640 : nil)
-        .frame(minWidth: 900, idealWidth: 1000, minHeight: 560, idealHeight: 640)
+        .frame(width: snapshot ? 1240 : nil, height: snapshot ? 760 : nil)
+        .frame(minWidth: 1120, idealWidth: 1240, minHeight: 620, idealHeight: 760)
         .background(Theme.bg)
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             for p in providers {
@@ -1075,82 +1236,95 @@ struct MainView: View {
 
     var toolbar: some View {
         HStack(spacing: 4) {
-            ToolButton(icon: "play.fill", text: "启动", enabled: model.appBuilt && !model.launching && model.busy == nil) { model.launch() }
-            ToolButton(icon: "hammer.fill", text: model.appBuilt ? "重建" : "构建", enabled: model.busy == nil && model.blockers.isEmpty) { model.build() }
-            ToolButton(icon: "square.and.arrow.down", text: "导入存档", enabled: { if case .ok = model.check(.save) { return true }; return false }()) { model.importSave() }
-            ToolButton(icon: "text.alignleft", text: "日志") { withAnimation { showLog.toggle() } }
+            Text("sw-launcher").font(.system(size: 13, weight: .semibold)).foregroundStyle(.secondary)
             Spacer()
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary).font(.system(size: 12))
-                TextField("搜索游戏", text: $query).textFieldStyle(.plain).font(.system(size: 12.5))
+                TextField("搜索游戏（中文、英文或游戏 ID）", text: $query).textFieldStyle(.plain).font(.system(size: 12.5))
             }
-            .padding(.horizontal, 10).padding(.vertical, 6).frame(width: 190)
+            .padding(.horizontal, 10).padding(.vertical, 6).frame(width: 260)
             .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            Picker("", selection: $filter) { ForEach(LibraryFilter.allCases) { Text($0.rawValue).tag($0) } }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 150).padding(.leading, 8)
-                .help("\(GameKind.all.count) 款游戏：MacNativeGames 2 款，nxnative \(GameCatalog.nx.count) 款")
             Picker("", selection: $grid) {
                 Image(systemName: "list.bullet").tag(false)
                 Image(systemName: "square.grid.2x2").tag(true)
-            }.pickerStyle(.segmented).labelsHidden().frame(width: 84).padding(.leading, 8)
-            SettingsLink { ToolLabel(icon: "gearshape", text: "设置", badge: !model.blockers.isEmpty) }.buttonStyle(.plain)
+            }.pickerStyle(.segmented).labelsHidden().frame(width: 84).padding(.horizontal, 8)
+            ToolButton(icon: "text.alignleft", text: "日志") { withAnimation { showLog.toggle() } }
+            SettingsLink { ToolLabel(icon: "gearshape", text: "设置") }.buttonStyle(.plain)
         }
-        .padding(.leading, snapshot ? 14 : 84).padding(.trailing, 14).padding(.bottom, 8).padding(.top, snapshot ? 8 : 6)
+        .padding(.leading, snapshot ? 14 : 84).padding(.trailing, 14).padding(.bottom, 6).padding(.top, snapshot ? 6 : 4)
         .background(Theme.panel)
     }
 
-    var warningBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-            Text("还缺：" + model.blockers.joined(separator: "、")).font(.system(size: 12))
-            Spacer()
-            SettingsLink { Text("打开设置").font(.system(size: 12, weight: .medium)).foregroundStyle(accent) }.buttonStyle(.plain)
+    // MARK: sidebar
+
+    var sidebar: some View {
+        let all = model.entries
+        return VStack(alignment: .leading, spacing: 2) {
+            sidebarHeader("游戏库")
+            ForEach([LibraryCategory.all, .added, .ready], id: \.self) { sidebarRow($0, count: all.filter($0.contains).count) }
+            sidebarHeader("引擎").padding(.top, 12)
+            ForEach([LibraryCategory.backend(.macnative), .backend(.nxnative)], id: \.self) { sidebarRow($0, count: all.filter($0.contains).count) }
+            Spacer(minLength: 12)
+            EnvCard(model: model)
         }
-        .padding(.horizontal, 18).padding(.vertical, 8)
-        .background(Color.orange.opacity(0.12))
+        .padding(10)
+        .background(Theme.panel.opacity(0.55))
+    }
+
+    func sidebarHeader(_ t: String) -> some View {
+        Text(t).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary).padding(.horizontal, 8).padding(.bottom, 2)
+    }
+
+    func sidebarRow(_ c: LibraryCategory, count: Int) -> some View {
+        let on = category == c
+        return Button { category = c } label: {
+            HStack(spacing: 8) {
+                Image(systemName: c.icon).frame(width: 18).foregroundStyle(on ? Color.white : accent)
+                Text(c.title).font(.system(size: 13, weight: on ? .semibold : .regular))
+                Spacer()
+                Text("\(count)").font(.system(size: 11, weight: .medium)).foregroundStyle(on ? Color.white.opacity(0.85) : Color.secondary)
+            }
+            .padding(.horizontal, 8).padding(.vertical, 6)
+            .background(on ? accent.opacity(0.55) : Color.clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .contentShape(Rectangle())
+        }.buttonStyle(.plain)
     }
 
     // MARK: library
 
     var library: some View {
         let shown = model.entries.filter { e in
-            (query.isEmpty || (e.title + e.subtitle).localizedCaseInsensitiveContains(query))
-                && (filter == .all || (filter == .added && e.status != .notAdded) || (filter == .ready && e.status == .built))
+            category.contains(e) && (query.isEmpty || (e.title + e.subtitle).localizedCaseInsensitiveContains(query))
         }
-        return Group {
-            if shown.isEmpty {
-                placeholder(icon: "magnifyingglass", text: query.isEmpty ? "还没有“\(filter.rawValue)”的游戏。把游戏文件拖进窗口，或到设置里选择。" : "没有匹配“\(query)”的游戏")
+        return VStack(spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(category.title).font(.system(size: 17, weight: .bold))
+                Text("\(shown.count) 款").font(.system(size: 12)).foregroundStyle(.secondary)
+                Spacer()
+                if case .backend(let b) = category {
+                    Text(b == .nxnative ? "seedds/nxnative · 可构建 Mac / iPad / iPhone" : "王国之泪、旷野之息 · 仅 Mac").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
             }
-            else if grid { gridView(shown) } else { listView(shown) }
+            .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 10)
+            Group {
+                if shown.isEmpty {
+                    placeholder(icon: "magnifyingglass", text: query.isEmpty ? "还没有“\(category.title)”的游戏。把游戏文件拖进窗口，或选中一款游戏后在右侧添加。" : "没有匹配“\(query)”的游戏")
+                }
+                else if grid { gridView(shown) } else { listView(shown) }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     func placeholder(icon: String, text: String) -> some View {
         VStack(spacing: 10) {
             Image(systemName: icon).font(.system(size: 30)).foregroundStyle(.secondary)
-            Text(text).foregroundStyle(.secondary)
+            Text(text).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 360)
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    var emptyState: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "arrow.down.doc").font(.system(size: 38, weight: .light)).foregroundStyle(accent)
-            Text("把游戏文件拖到这里").font(.system(size: 17, weight: .semibold))
-            Text("支持 .xci / .nsp（基础版 1.0.0）。你需要自己的游戏文件、prod.keys 和固件。").font(.system(size: 12)).foregroundStyle(.secondary)
-            HStack(spacing: 10) {
-                Button("选择游戏文件…") { if let p = model.pick(directory: false, extensions: ["xci", "nsp"], title: "选择游戏本体") { model.s.game = p } }
-                    .buttonStyle(.borderedProminent).tint(accent)
-                SettingsLink { Text("打开设置") }
-            }
-        }
-        .padding(40)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.white.opacity(0.12), style: StrokeStyle(lineWidth: 1.5, dash: [6, 5])).padding(24))
-    }
-
     // columns shared by header and rows
-    let wVersion: CGFloat = 80, wLang: CGFloat = 96, wStatus: CGFloat = 104, wSize: CGFloat = 80
+    let wVersion: CGFloat = 64, wStatus: CGFloat = 78
 
     func select(_ g: GameKind) { if model.busy == nil { model.s.selected = g } }
     func primaryAction() { if model.appBuilt { model.launch() } else if model.blockers.isEmpty { model.build() } }
@@ -1161,20 +1335,23 @@ struct MainView: View {
                 Section {
                     ForEach(shown, id: \.kind) { e in
                         let selected = e.kind == model.s.selected
-                        HStack(spacing: 14) {
-                            IconView(image: model.appIcon(e.kind), size: 56)
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack(spacing: 6) { Text(e.title).font(.system(size: 14.5, weight: .semibold)); if e.kind.experimental { TagView(kind: .experimental) } }
-                                Text(e.subtitle).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                                Text(e.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")).font(.system(size: 10.5)).foregroundStyle(.secondary.opacity(0.7)).lineLimit(1).truncationMode(.middle)
+                        HStack(spacing: 12) {
+                            IconView(image: model.appIcon(e.kind), size: 40)
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text(e.title).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
+                                    if e.kind.experimental { TagView(kind: .experimental) }
+                                }
+                                HStack(spacing: 6) {
+                                    if case .backend = category {} else { BackendBadge(backend: e.kind.backend) }
+                                    if e.kind.englishName != e.title { Text(e.kind.englishName).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1) }
+                                }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            Text(e.version).font(.system(size: 12.5)).frame(width: wVersion, alignment: .leading)
-                            Text(e.language).font(.system(size: 12.5)).frame(width: wLang, alignment: .leading)
+                            Text(e.version).font(.system(size: 12, design: .rounded)).foregroundStyle(.secondary).frame(width: wVersion, alignment: .leading)
                             statusPill(e.status).frame(width: wStatus, alignment: .leading)
-                            Text(e.size).font(.system(size: 12.5)).foregroundStyle(.secondary).frame(width: wSize, alignment: .trailing)
                         }
-                        .padding(.horizontal, 18).padding(.vertical, 10)
+                        .padding(.horizontal, 16).padding(.vertical, 8)
                         .background(selected ? accent.opacity(0.20) : Color.clear)
                         .overlay(alignment: .leading) { if selected { Rectangle().fill(accent).frame(width: 3) } }
                         .contentShape(Rectangle())
@@ -1182,25 +1359,22 @@ struct MainView: View {
                         .onTapGesture { select(e.kind) }
                         .contextMenu {
                             Button("启动游戏") { select(e.kind); model.launch() }.disabled(!model.appBuilt(e.kind))
-                            Button(model.appBuilt(e.kind) ? "重新构建" : "构建 App") { select(e.kind); model.build() }
+                            Button(model.appBuilt(e.kind) ? "重新构建" : "构建") { select(e.kind); model.build() }
                             Divider()
                             Button("在访达中显示 App") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: (model.s.settings(for: e.kind).outputApp as NSString).expandingTildeInPath)]) }.disabled(!model.appBuilt(e.kind))
                             Button("打开存档文件夹") { model.openFolder(GamePaths(e.kind, home: Paths.home).profileSave) }
                         }
-                        Rectangle().fill(Theme.line).frame(height: 1)
+                        Rectangle().fill(Theme.line).frame(height: 1).padding(.leading, 68)
                     }
                 } header: {
                     VStack(spacing: 0) {
-                        HStack(spacing: 14) {
-                            Text("游戏").frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 70)
+                        HStack(spacing: 12) {
+                            Text("游戏").frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 52)
                             Text("版本").frame(width: wVersion, alignment: .leading)
-                            Text("语言").frame(width: wLang, alignment: .leading)
                             Text("状态").frame(width: wStatus, alignment: .leading)
-                            Text("大小").frame(width: wSize, alignment: .trailing)
                         }
                         .font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                        .padding(.horizontal, 18).padding(.vertical, 7)
-                        .background(Theme.panel.opacity(0.7))
+                        .padding(.horizontal, 16).padding(.vertical, 6)
                         Rectangle().fill(Theme.line).frame(height: 1)
                     }
                     .background(Theme.bg)
@@ -1211,23 +1385,23 @@ struct MainView: View {
 
     func gridView(_ shown: [Model.Entry]) -> some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 190, maximum: 220), spacing: 20)], spacing: 20) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 190), spacing: 16)], spacing: 16) {
                 ForEach(shown, id: \.kind) { e in
                     let selected = e.kind == model.s.selected
-                    VStack(spacing: 10) {
-                        IconView(image: model.appIcon(e.kind), size: 128)
-                        Text(e.title).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
+                    VStack(spacing: 8) {
+                        IconView(image: model.appIcon(e.kind), size: 96)
+                        Text(e.title).font(.system(size: 12.5, weight: .semibold)).lineLimit(1)
                         HStack(spacing: 6) { Text(e.version).font(.system(size: 11)).foregroundStyle(.secondary); statusPill(e.status) }
-                        if e.kind.experimental { TagView(kind: .experimental) }
+                        BackendBadge(backend: e.kind.backend)
                     }
-                    .padding(18).frame(maxWidth: .infinity)
+                    .padding(14).frame(maxWidth: .infinity)
                     .background(selected ? accent.opacity(0.20) : Theme.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(selected ? accent : Theme.line))
                     .onTapGesture(count: 2) { select(e.kind); primaryAction() }
                     .onTapGesture { select(e.kind) }
                 }
             }
-            .padding(24)
+            .padding(18)
         }
     }
 
@@ -1235,7 +1409,7 @@ struct MainView: View {
         let (t, c): (String, Color) = switch s {
         case .built: ("可启动", accent)
         case .building: ("构建中", .orange)
-        case .notBuilt: ("未构建", .secondary)
+        case .notBuilt: ("未构建", .yellow.opacity(0.8))
         case .notAdded: ("未添加", .secondary)
         }
         return HStack(spacing: 5) { Circle().fill(c).frame(width: 7, height: 7); Text(t).font(.system(size: 12)) }
@@ -1261,7 +1435,7 @@ struct MainView: View {
                     ProgressView().controlSize(.small)
                     Text(model.notice ?? "正在启动…").font(.system(size: 11.5)).foregroundStyle(.secondary)
                 } else {
-                    Text(model.notice ?? (model.s.game.isEmpty ? "选中一款游戏，再到设置里选好游戏文件（也可以把文件拖进来）" : (model.appBuilt ? "就绪" : "还没有构建"))).font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(1)
+                    Text(model.notice ?? (model.s.game.isEmpty ? "选中一款游戏，在右侧点击添加游戏文件（也可以把文件拖进来）" : (model.appBuilt ? "就绪" : "还没有构建"))).font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
             Spacer()
@@ -1281,6 +1455,233 @@ struct MainView: View {
             Text(title).font(.system(size: 11.5, weight: .medium))
             Text(detail).font(.system(size: 11.5)).foregroundStyle(.secondary)
         }
+    }
+}
+
+// MARK: - Environment card (sidebar)
+
+/// The selected backend's requirements: what is installing in the background, and what only the player can install.
+struct EnvCard: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        let required = model.deps.filter(\.required)
+        let ready = required.filter { $0.state == .ok }.count
+        let checking = model.deps.contains { $0.state == .checking }
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Image(systemName: ready == required.count ? "checkmark.seal.fill" : "shippingbox").foregroundStyle(ready == required.count ? accent : .orange)
+                Text("运行环境").font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text(checking ? "检查中" : "\(ready)/\(required.count)").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Text(model.s.selected.backend.title + " 所需组件").font(.system(size: 10.5)).foregroundStyle(.secondary)
+            if let d = model.installingDep {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("后台安装：\(d.title)").font(.system(size: 11)).lineLimit(1)
+                }
+                if case .installing(let p?) = d.state { ProgressView(value: p).tint(accent) }
+            } else if ready == required.count && !checking {
+                Text("全部就绪").font(.system(size: 11)).foregroundStyle(accent)
+            }
+            ForEach(model.manualDeps) { d in
+                HStack(spacing: 6) {
+                    Image(systemName: "person.fill.questionmark").font(.system(size: 10)).foregroundStyle(.orange)
+                    Text(d.title).font(.system(size: 11)).lineLimit(1)
+                    Spacer(minLength: 2)
+                    Button("安装") { model.install(d.id) }.controlSize(.mini)
+                }.help(d.detail + "（需要你输入密码或在 App Store 里操作，不能自动安装）")
+            }
+            ForEach(model.deps.filter { if case .failed = $0.state { return true }; return false }) { d in
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 10)).foregroundStyle(.orange)
+                    Text(d.title + " 安装失败").font(.system(size: 11)).lineLimit(1)
+                    Spacer(minLength: 2)
+                    Button("重试") { model.install(d.id) }.controlSize(.mini)
+                }
+            }
+            Toggle("缺少的组件自动在后台安装", isOn: $model.s.autoInstall)
+                .toggleStyle(.checkbox).font(.system(size: 11))
+                .onChange(of: model.s.autoInstall) { if model.s.autoInstall { model.autoInstallNext() } }
+        }
+        .padding(10)
+        .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+// MARK: - Game detail (right pane)
+
+/// The selected game: version, its files (click to add), the build target, and build / start.
+struct GameDetail: View {
+    @ObservedObject var model: Model
+
+    var body: some View {
+        let g = model.s.selected
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    header(g)
+                    section("版本") { versionPicker(g) }
+                    section("游戏文件") { files(g) }
+                    section("共享文件（所有游戏通用）") { shared(g) }
+                    section("构建目标") { targetPicker(g) }
+                }
+                .padding(18)
+            }
+            Rectangle().fill(Theme.line).frame(height: 1)
+            VStack(alignment: .leading, spacing: 10) {   // build / start stay in view however long the pane above is
+                actions(g)
+                footer(g)
+            }
+            .padding(.horizontal, 18).padding(.vertical, 12)
+            .background(Theme.panel.opacity(0.6))
+        }
+        .background(Theme.panel.opacity(0.35))
+    }
+
+    func section<C: View>(_ title: String, @ViewBuilder _ c: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+            c()
+        }
+    }
+
+    func header(_ g: GameKind) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            IconView(image: model.appIcon(g), size: 68)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(g.displayName).font(.system(size: 17, weight: .bold)).lineLimit(2)
+                if g.englishName != g.displayName { Text(g.englishName).font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(2) }
+                HStack(spacing: 6) {
+                    BackendBadge(backend: g.backend)
+                    if g.experimental { TagView(kind: .experimental) }
+                    Text(g.titleID).font(.system(size: 10.5, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    // MARK: version
+
+    var versionBinding: Binding<String> {
+        Binding(get: { model.version }, set: { model.s.current.version = $0 })
+    }
+
+    @ViewBuilder func versionPicker(_ g: GameKind) -> some View {
+        let versions = g.supportedVersions
+        if versions.count <= 4 {
+            SegmentPicker(options: versions.map { .init(value: $0, label: $0) }, selection: versionBinding).disabled(model.busy != nil)
+        } else {
+            Picker("", selection: versionBinding) { ForEach(versions, id: \.self) { Text($0).tag($0) } }.labelsHidden().disabled(model.busy != nil)
+        }
+        Text(model.needsUpdate ? "需要游戏本体 + \(model.version) 的更新包" + (g.backend == .nxnative ? "（文件名要带 [v版本号]）" : "")
+                               : "只需要游戏本体（\(model.version)）")
+            .font(.system(size: 11)).foregroundStyle(.secondary)
+    }
+
+    // MARK: files
+
+    @ViewBuilder func files(_ g: GameKind) -> some View {
+        let nx = g.backend == .nxnative
+        FileSlot(title: "游戏本体", hint: nx ? "NSP / XCI / NSZ / XCZ" : (g == .botw ? "基础版 NSP" : "XCI / NSP（基础版）"), tag: .required,
+                 path: model.s.game, check: model.check(.game), choose: { model.choose(.game) }, clear: { model.s.game = "" })
+        if model.needsUpdate || !model.s.update.isEmpty {
+            FileSlot(title: "更新包 \(model.version)", hint: nx ? "NSP / NSZ，文件名带 [v版本号]" : "NSP / NSZ", tag: model.needsUpdate ? .required : .optional,
+                     path: model.s.update, check: model.check(.update), choose: { model.choose(.update) }, clear: { model.s.update = "" })
+        }
+        if nx {
+            FileSlot(title: "DLC", hint: "放 DLC 文件的文件夹", tag: .optional,
+                     path: model.s.dlc, check: model.check(.dlc), choose: { model.choose(.dlc) }, clear: { model.s.dlc = "" })
+        }
+    }
+
+    @ViewBuilder func shared(_ g: GameKind) -> some View {
+        FileSlot(title: "prod.keys", hint: "从你自己的 Switch 导出", tag: .required,
+                 path: model.s.keys, check: model.check(.keys), choose: { model.choose(.keys) }, clear: { model.s.keys = "" })
+        if g.backend == .macnative {
+            FileSlot(title: "固件", hint: "文件夹或 .zip", tag: .required,
+                     path: model.s.firmware, check: model.check(.firmware), choose: { model.choose(.firmware) }, clear: { model.s.firmware = "" })
+        } else {
+            Label("nxnative 不需要固件；游戏文件只做符号链接，不复制。", systemImage: "info.circle").font(.system(size: 11)).foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: build target
+
+    var target: NXTarget { model.s.selected.backend == .nxnative ? model.s.nxTarget : .macApp }
+
+    @ViewBuilder func targetPicker(_ g: GameKind) -> some View {
+        let nx = g.backend == .nxnative
+        SegmentPicker(options: [
+            .init(value: NXTarget.macApp, label: "Mac", icon: "desktopcomputer"),
+            .init(value: .xcode, label: "iPad/iPhone", icon: "ipad.and.iphone", enabled: nx),
+            .init(value: .ipa, label: "IPA", icon: "shippingbox", enabled: nx),
+        ], selection: Binding(get: { target }, set: { model.s.nxTarget = $0 }))
+        .disabled(model.busy != nil)
+        switch target {
+        case .macApp:
+            Text(nx ? "生成可以双击运行的 Mac App。" : "MacNativeGames 只能构建 Mac App；iPad / iPhone 请选 nxnative 的游戏。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+        case .xcode, .ipa:
+            Text(target == .xcode ? "生成 Xcode 工程并自动打开：登录自己的 Apple ID（免费的也行），选 Personal Team，连上设备点 Run。"
+                                  : "生成 IPA，用 Sideloadly / AltStore 登录自己的 Apple ID 签名安装。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Text("Team ID").font(.system(size: 11.5)).foregroundStyle(.secondary)
+                TextField("可留空", text: $model.s.teamID).textFieldStyle(.roundedBorder).font(.system(size: 12))
+            }
+            Toggle("免费 Apple ID（不申请“增大内存限制”）", isOn: $model.s.freeAppleID).font(.system(size: 11.5))
+                .help("免费账号无法申请这项权限；代价是大型游戏可能被系统关闭。签名 7 天后过期，重新 Run 即可。")
+        }
+    }
+
+    // MARK: build / start
+
+    var buildTitle: String {
+        switch target {
+        case .macApp: return model.appBuilt ? "重新构建" : "构建 Mac App"
+        case .xcode: return "生成 Xcode 工程"
+        case .ipa: return "生成 IPA"
+        }
+    }
+
+    @ViewBuilder func actions(_ g: GameKind) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if model.busy != nil, let p = model.progress {
+                ProgressView(value: p).tint(accent)
+                Text(model.step).font(.system(size: 11)).foregroundStyle(.secondary)
+            } else if model.busy != nil {
+                HStack(spacing: 6) { ProgressView().controlSize(.small); Text(model.busy ?? "").font(.system(size: 11.5)) }
+            }
+            HStack(spacing: 8) {
+                if target == .macApp && model.appBuilt {
+                    Button { model.launch() } label: { Label(model.launching ? "启动中…" : "启动", systemImage: "play.fill").frame(maxWidth: .infinity) }
+                        .buttonStyle(.borderedProminent).tint(accent).controlSize(.large)
+                        .disabled(model.launching || model.busy != nil)
+                    Button { model.build() } label: { Label("重建", systemImage: "hammer") }
+                        .controlSize(.large).disabled(model.busy != nil || !model.blockers.isEmpty)
+                } else {
+                    Button { model.build() } label: { Label(buildTitle, systemImage: "hammer.fill").frame(maxWidth: .infinity) }
+                        .buttonStyle(.borderedProminent).tint(accent).controlSize(.large)
+                        .disabled(model.busy != nil || !model.blockers.isEmpty)
+                }
+            }
+            if !model.blockers.isEmpty && model.busy == nil {
+                Label("还缺：" + model.blockers.joined(separator: "、"), systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11)).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    func footer(_ g: GameKind) -> some View {
+        HStack(spacing: 12) {
+            Button("存档文件夹") { model.openFolder(model.paths.profileSave) }
+            Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: (model.s.outputApp as NSString).expandingTildeInPath)]) }
+                .disabled(!model.appBuilt)
+            Spacer()
+            SettingsLink { Text("更多设置…") }
+        }
+        .buttonStyle(.borderless).font(.system(size: 11.5)).foregroundStyle(accent)
     }
 }
 
@@ -1431,7 +1832,7 @@ struct SettingsView: View {
             if let p = model.pick(directory: true, extensions: ["zip"], title: "选择固件") { model.s.firmware = p }
         }
         PathRow(title: model.s.selected == .botw ? "更新包（1.9.0，NSP）" : "更新包（1.1.2 / 1.4.3，NSP 或 NSZ）", tag: model.s.selected == .botw ? .required : .optional, value: $model.s.update, check: model.check(.update)) {
-            if let p = model.pick(directory: false, extensions: ["nsp", "nsz"], title: "选择更新包") { model.s.update = p }
+            model.choose(.update)
         }
     }
 
@@ -1439,8 +1840,8 @@ struct SettingsView: View {
         PathRow(title: "游戏本体（NSP / XCI / NSZ / XCZ）", tag: .required, value: $model.s.game, check: model.check(.game)) {
             if let p = model.pick(directory: false, extensions: ["nsp", "xci", "nsz", "xcz"], title: "选择游戏本体") { model.s.game = p }
         }
-        PathRow(title: "更新包（文件名要带 [v版本号]）", tag: model.nxNeedsUpdate ? .required : .optional, value: $model.s.update, check: model.check(.update)) {
-            if let p = model.pick(directory: false, extensions: ["nsp", "nsz"], title: "选择更新包") { model.s.update = p }
+        PathRow(title: "更新包（文件名要带 [v版本号]）", tag: model.needsUpdate ? .required : .optional, value: $model.s.update, check: model.check(.update)) {
+            model.choose(.update)
         }
         PathRow(title: "DLC 文件夹", tag: .optional, value: $model.s.dlc, check: model.check(.dlc)) {
             if let p = model.pick(directory: true, title: "选择放 DLC 文件的文件夹") { model.s.dlc = p }
@@ -1557,7 +1958,7 @@ struct SettingsView: View {
             HStack { Text("运行环境").font(.system(size: 13, weight: .semibold)); Spacer(); Button("重新检查") { model.refreshDeps() }.controlSize(.small) }
             Text(model.s.selected.backend == .nxnative ? "当前游戏用 nxnative 构建" : "当前游戏用 MacNativeGames 构建").font(.system(size: 11)).foregroundStyle(.secondary)
             ForEach(model.deps) { dep in DepRow(dep: dep) { model.install(dep.id) } }
-            Text("每一项都要你点“安装”才会执行。Homebrew、命令行工具、.NET 和 Xcode 设置需要密码，会在“终端”里打开命令。").font(.system(size: 11)).foregroundStyle(.secondary)
+            Text("打开“自动后台安装”时，不需要密码的组件会在前置条件就绪后自动安装；Homebrew、命令行工具、.NET 和 Xcode 设置需要密码，要你点“安装”在“终端”里运行。").font(.system(size: 11)).foregroundStyle(.secondary)
             if model.s.selected.backend == .nxnative {
                 Divider()
                 HStack {
@@ -1648,7 +2049,7 @@ struct LauncherApp: App {
                 let tab = args.firstIndex(of: "--settings").flatMap { Int(args[safe: $0 + 1] ?? "0") }
                 let root: AnyView = tab != nil ? AnyView(SettingsView(model: m, tab: tab!)) : AnyView(MainView(model: m, snapshot: true))
                 let host = NSHostingView(rootView: root.preferredColorScheme(.dark))
-                let size = tab != nil ? NSSize(width: 640, height: 470) : NSSize(width: 1000, height: 640)
+                let size = tab != nil ? NSSize(width: 640, height: 470) : NSSize(width: 1240, height: 760)
                 let win = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
                 win.appearance = NSAppearance(named: .darkAqua)
                 win.contentView = host
@@ -1669,7 +2070,7 @@ struct LauncherApp: App {
             MainView(model: model).preferredColorScheme(.dark)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1000, height: 640)
+        .defaultSize(width: 1240, height: 760)
         .commands {
             CommandMenu("操作") {
                 Button("启动游戏") { model.launch() }.keyboardShortcut("l").disabled(!model.appBuilt)

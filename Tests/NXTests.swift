@@ -22,6 +22,31 @@ func testCatalogHasAllNxnativeGames() {
     expect(GameKind.totk.supportedVersions == ["1.0.0", "1.1.2", "1.4.3"] && GameKind.botw.supportedVersions == ["1.9.0"], "MacNativeGames versions")
 }
 
+func testVersionSelection() {
+    let wonder = GameKind.nx("010015100B514000")
+    var gs = GameSettings()
+    expect(selectedVersion(wonder, settings: gs) == "1.2.1", "default: nxnative's package")
+    gs.update = "~/w/Wonder [010015100B514800][v65536].nsp"
+    expect(selectedVersion(wonder, settings: gs) == "1.0.1", "from the update's [v] tag")
+    gs.version = "1.0.0"
+    expect(selectedVersion(wonder, settings: gs) == "1.0.0", "the player's choice wins")
+    expect(!versionNeedsUpdate(wonder, version: "1.0.0") && versionNeedsUpdate(wonder, version: "1.2.1"), "only v0 builds without an update")
+    gs.version = "9.9.9"
+    expect(selectedVersion(wonder, settings: gs) == "1.0.1", "an unknown choice is ignored")
+    expect(selectedVersion(.totk, settings: GameSettings()) == "1.4.3", "TOTK default: newest")
+    expect(!versionNeedsUpdate(.totk, version: "1.0.0") && versionNeedsUpdate(.totk, version: "1.1.2") && versionNeedsUpdate(.botw, version: "1.9.0"), "MacNativeGames")
+    expect(updateVersion(.totk, fileName: "TOTK v1.4.3 [0100F2C0115B6800][UPD].nsp") == "1.4.3", "TOTK update name")
+}
+
+func testAutoInstallSettingRoundTrip() {
+    let home = tempHome(), file = home.appendingPathComponent("s.json")
+    var s = LauncherSettings.load(from: file, legacy: home.appendingPathComponent("none"), home: home)
+    expect(s.autoInstall, "on by default")
+    s.autoInstall = false; s.current.version = "1.1.2"; s.write(to: file)
+    let r = LauncherSettings.load(from: file, legacy: home.appendingPathComponent("none"), home: home)
+    expect(!r.autoInstall && r.current.version == "1.1.2", "round trip")
+}
+
 func testGameKindIsAPlainStringInJSON() {
     let data = try! JSONEncoder().encode(["k": GameKind.totk, "n": GameKind.nx("0100152000022000")])
     let text = String(decoding: data, as: UTF8.self)
@@ -290,6 +315,7 @@ func testRunningNxGameIsFoundByItsHost() {
 }
 
 let nxTests: [(String, () -> Void)] = [
+    ("testVersionSelection", testVersionSelection), ("testAutoInstallSettingRoundTrip", testAutoInstallSettingRoundTrip),
     ("testCatalogHasAllNxnativeGames", testCatalogHasAllNxnativeGames), ("testGameKindIsAPlainStringInJSON", testGameKindIsAPlainStringInJSON),
     ("testNxPathsFollowTheMacApp", testNxPathsFollowTheMacApp), ("testNxDefaultsAndNames", testNxDefaultsAndNames),
     ("testV110SettingsFileStillLoads", testV110SettingsFileStillLoads), ("testNxChoicesRoundTrip", testNxChoicesRoundTrip),
