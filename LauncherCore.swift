@@ -148,6 +148,8 @@ struct GameSettings: Codable, Equatable {
     var modsEnabled: [String: Bool] = [:]
     /// nxnative only: the player's choices (variable -> value); a setting that is not here keeps the game's default.
     var nxEnv: [String: String] = [:]
+    /// The version to build (one of `GameKind.supportedVersions`); empty = `selectedVersion(_:settings:)` decides.
+    var version = ""
 
     init() {}
     /// Tolerant: the settings file of an older version lacks the newer keys.
@@ -155,7 +157,7 @@ struct GameSettings: Codable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         func str(_ k: CodingKeys) -> String { (try? c.decodeIfPresent(String.self, forKey: k)) ?? "" }
         game = str(.game); update = str(.update); dlc = str(.dlc); save = str(.save); mods = str(.mods)
-        outputApp = str(.outputApp); workDir = str(.workDir)
+        outputApp = str(.outputApp); workDir = str(.workDir); version = str(.version)
         modOrder = (try? c.decodeIfPresent([String].self, forKey: .modOrder)) ?? []
         modsEnabled = (try? c.decodeIfPresent([String: Bool].self, forKey: .modsEnabled)) ?? [:]
         nxEnv = (try? c.decodeIfPresent([String: String].self, forKey: .nxEnv)) ?? [:]
@@ -184,9 +186,11 @@ struct LauncherSettings: Codable {
     var nxTarget: NXTarget = .macApp, teamID = "", freeAppleID = true
     /// nxnative Xcode target: the workspace path; empty = `nxWorkspacePath(stage:)`.
     var nxWorkspace = ""
+    /// Install the missing requirements in the background as soon as what they need is there (Homebrew packages, build tools, nxnative).
+    var autoInstall = true
     private var home: URL { FileManager.default.homeDirectoryForCurrentUser }
 
-    enum CodingKeys: String, CodingKey { case selected, games, keys, firmware, language, projectDir, nxDir, nxTarget, teamID, freeAppleID, nxWorkspace }
+    enum CodingKeys: String, CodingKey { case selected, games, keys, firmware, language, projectDir, nxDir, nxTarget, teamID, freeAppleID, nxWorkspace, autoInstall }
 
     init() {}
     /// Tolerant: a v1.1.0 file has no nxDir, and an unknown game id (a game removed from the catalog) is kept as it is.
@@ -199,6 +203,7 @@ struct LauncherSettings: Codable {
         projectDir = str(.projectDir, ""); nxDir = str(.nxDir, ""); teamID = str(.teamID, ""); nxWorkspace = str(.nxWorkspace, "")
         nxTarget = (try? c.decodeIfPresent(NXTarget.self, forKey: .nxTarget)) ?? .macApp
         freeAppleID = (try? c.decodeIfPresent(Bool.self, forKey: .freeAppleID)) ?? true
+        autoInstall = (try? c.decodeIfPresent(Bool.self, forKey: .autoInstall)) ?? true
     }
 
     static func fresh(home: URL) -> LauncherSettings {
@@ -217,6 +222,7 @@ struct LauncherSettings: Codable {
             if !read.projectDir.isEmpty { s.projectDir = read.projectDir }
             if !read.nxDir.isEmpty { s.nxDir = read.nxDir }
             s.nxTarget = read.nxTarget; s.teamID = read.teamID; s.freeAppleID = read.freeAppleID; s.nxWorkspace = read.nxWorkspace
+            s.autoInstall = read.autoInstall
             for (k, v) in read.games { s.games[k] = v }
             return s
         }
@@ -647,6 +653,29 @@ func gameForFileName(_ name: String, current: GameKind) -> (game: GameKind, isUp
         return (.nx(base), isUpdate)
     }
     return nil
+}
+
+/// The version an update file brings `g` to, read from its name: nxnative's `[v<N>]` tag, or the TOTK update's version number.
+func updateVersion(_ g: GameKind, fileName: String) -> String? {
+    if let info = g.nxInfo { return versionTag(inFileName: fileName).flatMap(info.build(forTag:)) }
+    if g == .botw { return "1.9.0" }
+    if fileName.contains("1.4.3") || fileName.contains("720896") { return "1.4.3" }
+    if fileName.contains("1.1.2") || fileName.contains("65536") { return "1.1.2" }
+    return nil
+}
+
+/// The version to build: the player's choice, else what the update file says, else nxnative's default package / the newest one.
+func selectedVersion(_ g: GameKind, settings gs: GameSettings) -> String {
+    let all = g.supportedVersions
+    if all.contains(gs.version) { return gs.version }
+    if !gs.update.isEmpty, let v = updateVersion(g, fileName: (gs.update as NSString).lastPathComponent), all.contains(v) { return v }
+    return g.nxInfo?.packageDisplay ?? all.last ?? ""
+}
+
+/// Whether `version` needs an update file: every version but the base game (nxnative's v0 build, TOTK 1.0.0).
+func versionNeedsUpdate(_ g: GameKind, version: String) -> Bool {
+    if let info = g.nxInfo { return info.builds.first { $0.display == version }?.version != "v0" }
+    return g == .botw || version != "1.0.0"
 }
 
 /// Fills `stage` with symlinks to `files` (nxnative wants one game per folder: base, updates and DLC together). Only symlinks are ever
