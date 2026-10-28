@@ -7,6 +7,8 @@ import Foundation
 
 /// `--demo`: fixed sample data for documentation screenshots; never reads or writes the real settings.
 let isDemoMode = CommandLine.arguments.contains("--demo")
+/// `--snapshot <png>`: renders one window and exits; nothing is probed or installed.
+let isSnapshot = CommandLine.arguments.contains("--snapshot")
 
 enum Paths {
     static let home = FileManager.default.homeDirectoryForCurrentUser
@@ -17,6 +19,17 @@ enum Paths {
     static let cleanKeys = launcher.appendingPathComponent("prod.keys")
     /// The Python environment of nxnative's build scripts.
     static let nxVenv = launcher.appendingPathComponent("nx-venv")
+    /// eShop icons, 256 px, by title ID.
+    static let covers = home.appendingPathComponent("Library/Caches/sw-launcher/covers")
+}
+
+/// A JPEG of `data` (any image) scaled to fit `side` pixels.
+func thumbnailJPEG(_ data: Data, side: Int) -> Data? {
+    guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+          let img = CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                                kCGImageSourceThumbnailMaxPixelSize: side,
+                                                                kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { return nil }
+    return NSBitmapImageRep(cgImage: img).representation(using: .jpeg, properties: [.compressionFactor: 0.85])
 }
 
 struct Language: Identifiable, Hashable {
@@ -159,6 +172,7 @@ final class Model: ObservableObject {
             if !isDemoMode { s.write(to: Paths.config) }
             if s.selected.backend != oldValue.selected.backend { refreshDeps() }   // each backend has its own list of requirements
             if s.network != oldValue.network { Model.autoTried.removeAll(); refreshDeps() }   // other download sources: worth another try
+            if s.showCovers != oldValue.showCovers { coverRequested.removeAll(); if !s.showCovers { covers = [:] } }
         }
     }
     /// Folders of the selected game.
@@ -175,6 +189,9 @@ final class Model: ObservableObject {
     @Published var shaderBaked = 0
     @Published var modList: [ModInfo] = []
     @Published var modWarnings: [String] = []
+    /// Game pictures loaded so far, by title ID (from the extraction or the eShop cache).
+    @Published var covers: [String: NSImage] = [:]
+    private var coverRequested: Set<String> = []
     /// The system proxy, passed on to every installer and build (an app opened from Finder does not pass it by itself).
     @Published var proxyEnv: [String: String] = [:]
     /// Whether PyPI and GitHub answered quickly; probed once at start, before anything is installed automatically.
@@ -192,7 +209,8 @@ final class Model: ObservableObject {
             proxyEnv = systemProxyEnvironment(scutil: sh("/usr/sbin/scutil --proxy").out).merging(own) { $1 }
         }
         deps = Model.makeDeps(project: s.projectDir, nxDir: s.nxDir, backend: s.selected.backend, mirror: mirror)
-        if !isDemoMode { refreshCatalog(); probeNetwork() }
+        if !isDemoMode { refreshCatalog() }
+        if !isDemoMode && !isSnapshot { probeNetwork() }
         if isDemoMode { demo() }
     }
 
@@ -763,6 +781,29 @@ extension Model {
             if let img = NSImage(contentsOfFile: app + "/Contents/Resources/" + name) { return img }
         }
         return nil
+    }
+
+    /// The game's picture: the built app's icon, else the icon nxnative extracted from the player's own file or the eShop icon.
+    func cover(_ g: GameKind) -> NSImage? { appIcon(g) ?? covers[g.titleID] }
+
+    /// Loads the game's picture once: the extracted icon, else the cached eShop icon, else downloads it (256 px) into the cache.
+    func requestCover(_ g: GameKind) {
+        let id = g.titleID
+        guard !isDemoMode, covers[id] == nil, !coverRequested.contains(id), appIcon(g) == nil else { return }
+        coverRequested.insert(id)
+        let work = URL(fileURLWithPath: (s.settings(for: g).workDir as NSString).expandingTildeInPath)
+        let cached = Paths.covers.appendingPathComponent(id + ".jpg")
+        let remote = s.showCovers ? coverURLs[id].flatMap(URL.init(string:)) : nil
+        Task.detached {
+            let local = extractedIcon(workDir: work, titleID: id).flatMap(NSImage.init(contentsOf:))
+                ?? (remote == nil ? nil : NSImage(contentsOf: cached))
+            if let local { await MainActor.run { self.covers[id] = local }; return }
+            guard let remote, let r = try? await URLSession.shared.data(from: remote), (r.1 as? HTTPURLResponse)?.statusCode == 200,
+                  let small = thumbnailJPEG(r.0, side: 256), let img = NSImage(data: small) else { return }
+            try? FileManager.default.createDirectory(at: Paths.covers, withIntermediateDirectories: true)
+            try? small.write(to: cached, options: .atomic)
+            await MainActor.run { self.covers[id] = img }
+        }
     }
 
     var shaderDir: URL { paths.shaderDir }
@@ -1431,7 +1472,7 @@ struct MainView: View {
                     ForEach(shown, id: \.kind) { e in
                         let selected = e.kind == model.s.selected
                         HStack(spacing: 12) {
-                            IconView(image: model.appIcon(e.kind), size: 40)
+                            IconView(image: model.cover(e.kind), size: 40).onAppear { model.requestCover(e.kind) }
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack(spacing: 6) {
                                     Text(e.title).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
@@ -1484,7 +1525,7 @@ struct MainView: View {
                 ForEach(shown, id: \.kind) { e in
                     let selected = e.kind == model.s.selected
                     VStack(spacing: 8) {
-                        IconView(image: model.appIcon(e.kind), size: 96)
+                        IconView(image: model.cover(e.kind), size: 96).onAppear { model.requestCover(e.kind) }
                         Text(e.title).font(.system(size: 12.5, weight: .semibold)).lineLimit(1)
                         HStack(spacing: 6) { Text(e.version).font(.system(size: 11)).foregroundStyle(.secondary); statusPill(e.status) }
                         BackendBadge(backend: e.kind.backend)
@@ -1653,7 +1694,7 @@ struct GameDetail: View {
 
     func header(_ g: GameKind) -> some View {
         HStack(alignment: .top, spacing: 14) {
-            IconView(image: model.appIcon(g), size: 68)
+            IconView(image: model.cover(g), size: 68).onAppear { model.requestCover(g) }.onChange(of: g) { model.requestCover(g) }
             VStack(alignment: .leading, spacing: 4) {
                 Text(g.displayName).font(.system(size: 17, weight: .bold)).lineLimit(2)
                 if g.englishName != g.displayName { Text(g.englishName).font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(2) }
@@ -2026,6 +2067,7 @@ struct SettingsView: View {
                 Spacer()
                 Picker("", selection: $model.s.language) { ForEach(Language.all) { Text($0.name).tag($0.code) } }.labelsHidden().frame(width: 190)
             }
+            Toggle("显示游戏封面（还没构建的游戏从任天堂官方商店服务器下载图标并缓存）", isOn: $model.s.showCovers).font(.system(size: 12))
             Divider()
             Text("这台 Mac").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 9) {
@@ -2217,7 +2259,8 @@ struct LauncherApp: App {
                 win.contentView = host
                 host.frame = NSRect(origin: .zero, size: size)
                 host.layoutSubtreeIfNeeded()
-                RunLoop.current.run(until: Date().addingTimeInterval(0.9))
+                let wait = args.firstIndex(of: "--wait").flatMap { Double(args[safe: $0 + 1] ?? "") } ?? 0.9   // e.g. for covers to download
+                RunLoop.current.run(until: Date().addingTimeInterval(wait))
                 if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
                     host.cacheDisplay(in: host.bounds, to: rep)
                     if let png = rep.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: out)) }

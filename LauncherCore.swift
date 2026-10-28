@@ -190,9 +190,11 @@ struct LauncherSettings: Codable {
     var autoInstall = true
     /// Download source for the installers and builds (official, or mirrors when no proxy is set).
     var network: NetworkMode = .auto
+    /// Show the eShop icon of games that are not built yet (downloaded from Nintendo's CDN and cached).
+    var showCovers = true
     private var home: URL { FileManager.default.homeDirectoryForCurrentUser }
 
-    enum CodingKeys: String, CodingKey { case selected, games, keys, firmware, language, projectDir, nxDir, nxTarget, teamID, freeAppleID, nxWorkspace, autoInstall, network }
+    enum CodingKeys: String, CodingKey { case selected, games, keys, firmware, language, projectDir, nxDir, nxTarget, teamID, freeAppleID, nxWorkspace, autoInstall, network, showCovers }
 
     init() {}
     /// Tolerant: a v1.1.0 file has no nxDir, and an unknown game id (a game removed from the catalog) is kept as it is.
@@ -207,6 +209,7 @@ struct LauncherSettings: Codable {
         freeAppleID = (try? c.decodeIfPresent(Bool.self, forKey: .freeAppleID)) ?? true
         autoInstall = (try? c.decodeIfPresent(Bool.self, forKey: .autoInstall)) ?? true
         network = (try? c.decodeIfPresent(NetworkMode.self, forKey: .network)) ?? .auto
+        showCovers = (try? c.decodeIfPresent(Bool.self, forKey: .showCovers)) ?? true
     }
 
     static func fresh(home: URL) -> LauncherSettings {
@@ -225,7 +228,7 @@ struct LauncherSettings: Codable {
             if !read.projectDir.isEmpty { s.projectDir = read.projectDir }
             if !read.nxDir.isEmpty { s.nxDir = read.nxDir }
             s.nxTarget = read.nxTarget; s.teamID = read.teamID; s.freeAppleID = read.freeAppleID; s.nxWorkspace = read.nxWorkspace
-            s.autoInstall = read.autoInstall; s.network = read.network
+            s.autoInstall = read.autoInstall; s.network = read.network; s.showCovers = read.showCovers
             for (k, v) in read.games { s.games[k] = v }
             return s
         }
@@ -659,6 +662,15 @@ func gameForFileName(_ name: String, current: GameKind) -> (game: GameKind, isUp
         return (.nx(base), isUpdate)
     }
     return nil
+}
+
+/// The icon nxnative's extraction saved from the player's own game file: <work>/<title ID>_build/extract/<version>/icon.jpg,
+/// the newest version's first.
+func extractedIcon(workDir: URL, titleID: String) -> URL? {
+    let ex = workDir.appendingPathComponent("\(titleID)_build/extract")
+    let versions = (try? FileManager.default.contentsOfDirectory(at: ex, includingPropertiesForKeys: nil)) ?? []
+    return versions.map { $0.appendingPathComponent("icon.jpg") }.sorted { $0.path.localizedStandardCompare($1.path) == .orderedDescending }
+        .first { FileManager.default.fileExists(atPath: $0.path) }
 }
 
 /// The version an update file brings `g` to, read from its name: nxnative's `[v<N>]` tag, or the TOTK update's version number.

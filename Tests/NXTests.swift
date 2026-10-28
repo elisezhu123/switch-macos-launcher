@@ -22,6 +22,17 @@ func testCatalogHasAllNxnativeGames() {
     expect(GameKind.totk.supportedVersions == ["1.0.0", "1.1.2", "1.4.3"] && GameKind.botw.supportedVersions == ["1.9.0"], "MacNativeGames versions")
 }
 
+func testExtractedIcon() {
+    let work = tempHome()
+    expect(extractedIcon(workDir: work, titleID: "0100DCA0064A6000") == nil, "nothing extracted yet")
+    write("x", to: work.appendingPathComponent("0100DCA0064A6000_build/extract/v0/icon.jpg"))
+    write("x", to: work.appendingPathComponent("0100DCA0064A6000_build/extract/v327680/icon.jpg"))
+    expect(extractedIcon(workDir: work, titleID: "0100DCA0064A6000")?.path.hasSuffix("v327680/icon.jpg") == true, "the newest version's icon")
+    var s = LauncherSettings(); s.showCovers = false
+    let back = try! JSONDecoder().decode(LauncherSettings.self, from: JSONEncoder().encode(s))
+    expect(!back.showCovers && (try! JSONDecoder().decode(LauncherSettings.self, from: Data("{}".utf8))).showCovers, "covers setting: kept, on by default")
+}
+
 func testVersionSelection() {
     let wonder = GameKind.nx("010015100B514000")
     var gs = GameSettings()
@@ -341,7 +352,7 @@ func testRunningNxGameIsFoundByItsHost() {
 }
 
 let nxTests: [(String, () -> Void)] = [
-    ("testProxyDetectionAndMirrors", testProxyDetectionAndMirrors), ("testVersionSelection", testVersionSelection), ("testAutoInstallSettingRoundTrip", testAutoInstallSettingRoundTrip),
+    ("testExtractedIcon", testExtractedIcon), ("testProxyDetectionAndMirrors", testProxyDetectionAndMirrors), ("testVersionSelection", testVersionSelection), ("testAutoInstallSettingRoundTrip", testAutoInstallSettingRoundTrip),
     ("testCatalogHasAllNxnativeGames", testCatalogHasAllNxnativeGames), ("testGameKindIsAPlainStringInJSON", testGameKindIsAPlainStringInJSON),
     ("testNxPathsFollowTheMacApp", testNxPathsFollowTheMacApp), ("testNxDefaultsAndNames", testNxDefaultsAndNames),
     ("testV110SettingsFileStillLoads", testV110SettingsFileStillLoads), ("testNxChoicesRoundTrip", testNxChoicesRoundTrip),
