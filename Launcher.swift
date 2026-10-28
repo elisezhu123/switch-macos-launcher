@@ -235,16 +235,16 @@ final class Model: ObservableObject {
 
     var hasProxy: Bool { proxyEnv.keys.contains { $0.lowercased() != "no_proxy" } }
     var mirror: Bool { useMirrors(s.network, proxy: hasProxy, officialFast: officialFast) }
-    var netEnv: [String: String] { networkEnvironment(mirror: mirror, proxy: proxyEnv) }
+    var netEnv: [String: String] { networkEnvironment(mirror: mirror, proxy: proxyEnv, nugetMirror: s.network != .direct) }
     var netSummary: String {
         let proxy = proxyEnv["https_proxy"] ?? proxyEnv["http_proxy"] ?? proxyEnv["all_proxy"]
         let found = proxy.map { "检测到代理 \($0.replacingOccurrences(of: "http://", with: ""))" } ?? "没有检测到代理"
         switch s.network {
         case .direct: return found + "；按设置使用官方源"
-        case .mirror: return found + "；按设置使用国内镜像（清华 TUNA、中科大、ghfast）"
+        case .mirror: return found + "；按设置使用国内镜像（清华 TUNA、中科大、华为云、ghfast）"
         case .auto:
             if !netChecked { return found + "；正在测试官方源速度…" }
-            if !hasProxy { return found + "，使用国内镜像（清华 TUNA、中科大、ghfast）" }
+            if !hasProxy { return found + "，使用国内镜像（清华 TUNA、中科大、华为云、ghfast）" }
             return officialFast ? found + "，官方源速度正常，使用官方源" : found + "，但官方源响应慢，改用国内镜像"
         }
     }
@@ -2102,7 +2102,7 @@ struct SettingsView: View {
                 Text("下载源").font(.system(size: 12))
                 Picker("", selection: $model.s.network) { ForEach(NetworkMode.allCases, id: \.self) { Text($0.label).tag($0) } }.labelsHidden().frame(width: 320)
             }
-            Text(model.netSummary + "。Homebrew、Python 组件、MacNativeGames 和 nxnative 会走所选的源；Xcode、Metal Toolchain 来自 Apple，.NET 来自微软。")
+            Text(model.netSummary + "。Homebrew、Python 组件、MacNativeGames 和 nxnative 会走所选的源；NuGet（nx_extract 的依赖）除非选“总是用官方源”，一律走华为云镜像（官方源时常断连）；Xcode、Metal Toolchain 来自 Apple，.NET 来自微软。")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             Text(model.s.selected.backend == .nxnative ? "当前游戏用 nxnative 构建" : "当前游戏用 MacNativeGames 构建").font(.system(size: 11)).foregroundStyle(.secondary)
             ForEach(model.deps) { dep in DepRow(dep: dep) { model.install(dep.id) } }

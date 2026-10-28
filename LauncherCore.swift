@@ -793,21 +793,28 @@ func systemProxyEnvironment(scutil: String) -> [String: String] {
 }
 
 /// Everything an installer or build gets: the proxy, the mirrors when they are used, and pip timeouts so a stalled download fails
-/// with a message instead of hanging.
-func networkEnvironment(mirror: Bool, proxy: [String: String]) -> [String: String] {
+/// with a message instead of hanging. `nugetMirror`: api.nuget.org drops TLS connections now and then even behind a proxy (a
+/// startup probe cannot see that), and one failed request fails the whole nx_extract build, so the NuGet mirror is used unless
+/// the player chose the official sources.
+func networkEnvironment(mirror: Bool, proxy: [String: String], nugetMirror: Bool = false) -> [String: String] {
     proxy.merging(mirrorEnvironment(mirror)) { $1 }.merging(["PIP_DEFAULT_TIMEOUT": "60", "PIP_RETRIES": "5"]) { $1 }
+        .merging(mirror || nugetMirror ? ["RestoreSources": Mirrors.nuget] : [:]) { $1 }
 }
 
-/// `curl` exit status 0 when PyPI and GitHub both answer within 4 s (through `proxy`).
+/// `curl` exit status 0 when PyPI, GitHub and NuGet all answer within 4 s (through the proxy in the environment).
 func officialSourcesProbe() -> String {
-    "curl -sfI -o /dev/null -m 4 https://pypi.org/simple/pip/ && curl -sfI -o /dev/null -m 4 https://github.com/"
+    ["https://pypi.org/simple/pip/", "https://github.com/", "https://api.nuget.org/v3/index.json"]
+        .map { "curl -sfI -o /dev/null -m 4 \($0)" }.joined(separator: " && ")
 }
 
-/// Homebrew and PyPI: TUNA (Tsinghua); the Homebrew installer: USTC's copy of the official script; git clones: a GitHub proxy.
+/// Homebrew and PyPI: TUNA (Tsinghua); the Homebrew installer: USTC's copy of the official script; git clones: a GitHub proxy;
+/// NuGet (the packages of nxnative's nx_extract): Huawei Cloud, passed as the MSBuild property RestoreSources (MSBuild reads
+/// environment variables as properties), so the player's own NuGet configuration is not touched.
 enum Mirrors {
     static let pypi = "https://pypi.tuna.tsinghua.edu.cn/simple"
     static let github = "https://ghfast.top/"
     static let brewInstaller = "https://mirrors.ustc.edu.cn/misc/brew-install.sh"
+    static let nuget = "https://repo.huaweicloud.com/repository/nuget/v3/index.json"
     static let environment: [String: String] = [
         "HOMEBREW_API_DOMAIN": "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api",
         "HOMEBREW_BOTTLE_DOMAIN": "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles",
